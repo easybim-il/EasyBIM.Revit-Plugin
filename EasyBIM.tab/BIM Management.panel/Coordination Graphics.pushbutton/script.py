@@ -3408,7 +3408,26 @@ def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
     fixable from this tool's own Settings (it's Revit project data), so
     instead of just warning, create (or reuse) a rotated COPY of the
     pattern -- never rotate the original in place, since other elements
-    in the model may already legitimately rely on its current angle."""
+    in the model may already legitimately rely on its current angle.
+
+    BUG FOUND LIVE: building a blank `DB.FillPattern()`, setting `.Name`
+    on it, then calling `.SetFillGrids(...)` and only THEN
+    `FillPatternElement.Create(doc, new_fp)` reliably threw "fillPattern
+    does not have a valid Name" from Create() itself -- something about
+    that order (most likely SetFillGrids on a still-unattached FillPattern
+    resetting/discarding whatever was assigned before it) leaves Name
+    unset by the time Create() validates it. Every real Structure/
+    Architecture diagonal pattern seen so far (Diagonal up/down 1.5mm) is
+    a single FillGrid with no dash Segments, which is exactly what
+    Revit's own `FillPattern(name, target, hostOrientation, angle,
+    spacing)` constructor is for -- name is part of construction, not a
+    property set afterward, so there's no ordering pitfall to hit at all.
+    Used for that common case; the manual FillGrid-rebuilding path (still
+    needed for a multi-grid pattern, e.g. a cross-hatch, or one with dash
+    Segments, neither of which that simpler constructor can express) is
+    kept as a fallback, with Name set LAST as a defensive measure against
+    the same suspected ordering issue -- unverified live, since no
+    multi-grid Structure/Architecture pattern has been seen in practice."""
     original_fpe = doc.GetElement(original_id)
     original_name = _elem_name(original_fpe)
     rotated_name = original_name + u"_Rotated45"
@@ -3418,23 +3437,31 @@ def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
             return fpe.Id
 
     original_fp = original_fpe.GetFillPattern()
-    new_fp = DB.FillPattern()
-    new_fp.Name = rotated_name
-    new_fp.Target = original_fp.Target
-    new_fp.HostOrientation = original_fp.HostOrientation
+    grids = list(original_fp.GetFillGrids())
+    angle_offset = math.radians(angle_degrees)
 
-    new_grids = []
-    for g in original_fp.GetFillGrids():
-        ng = DB.FillGrid()
-        ng.Origin = g.Origin
-        ng.Angle = g.Angle + math.radians(angle_degrees)
-        ng.Offset = g.Offset
-        ng.Shift = g.Shift
-        segs = list(g.GetSegments())
-        if segs:
-            ng.SetSegments(segs)
-        new_grids.append(ng)
-    new_fp.SetFillGrids(new_grids)
+    if len(grids) == 1 and not list(grids[0].GetSegments()):
+        g = grids[0]
+        new_fp = DB.FillPattern(
+            rotated_name, original_fp.Target, original_fp.HostOrientation,
+            g.Angle + angle_offset, g.Offset)
+    else:
+        new_fp = DB.FillPattern()
+        new_fp.Target = original_fp.Target
+        new_fp.HostOrientation = original_fp.HostOrientation
+        new_grids = []
+        for g in grids:
+            ng = DB.FillGrid()
+            ng.Origin = g.Origin
+            ng.Angle = g.Angle + angle_offset
+            ng.Offset = g.Offset
+            ng.Shift = g.Shift
+            segs = list(g.GetSegments())
+            if segs:
+                ng.SetSegments(segs)
+            new_grids.append(ng)
+        new_fp.SetFillGrids(new_grids)
+        new_fp.Name = rotated_name
 
     new_fpe = DB.FillPatternElement.Create(doc, new_fp)
     return new_fpe.Id
