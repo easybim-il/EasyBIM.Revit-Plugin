@@ -221,8 +221,12 @@ __author__ = "EasyBIM"
 __doc__ = "Color-code concrete Walls/Columns/Framing/Foundations in the Architecture and Structure links via View Filters."
 
 import clr
+import datetime
 import re
 import traceback
+import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 
 clr.AddReference('RevitAPI')
 clr.AddReference('RevitAPIUI')
@@ -245,7 +249,7 @@ from System.Windows.Markup import XamlReader
 from System.IO import StringReader
 from System.Xml import XmlReader as SysXmlReader
 
-from pyrevit import revit, script
+from pyrevit import forms, revit, script
 from easybim import coordination_settings as cfgmod
 from easybim import coordination_settings_ui as settings_ui
 from easybim import ui as ebui
@@ -3016,6 +3020,265 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2D MISMATCH DETECTION + BCF EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+MISMATCH_2D_TOLERANCE_FT = 0.5
+# ~150mm default — a Structure/Architecture concrete footprint pair within
+# this in every direction is treated as "the same element coordinated
+# correctly"; anything wider is flagged. Passed as detect_2d_mismatches'
+# tolerance_ft, not hardcoded there, so a future Settings.json key can
+# override it without touching this function.
+
+
+def get_concrete_elements(link_doc, categories, cfg):
+    """Same classification signals as _collect_concrete_type_names (type-
+    level _type_is_concrete, including its manual include/exclude and
+    Material Class checks, plus the per-instance _instance_material_texts
+    override) so mismatch detection only ever flags/matches elements that
+    would ALSO get colored by the visual hatch -- a "mismatch" that isn't
+    even classified as concrete would be meaningless noise. Returns actual
+    Element objects (not just Type Names, unlike _collect_concrete_type_
+    names) since detect_2d_mismatches needs each instance's own geometry.
+    Deliberately NOT calling _collect_concrete_type_names itself and
+    reshaping its result -- that function is load-bearing, live-tested
+    production logic (see its own docstring's bug-fix history) collecting
+    names into a set; duplicating its per-element loop here instead of
+    changing its signature/return shape keeps that function's proven
+    behavior completely untouched. No nested-link recursion (unlike
+    _collect_concrete_type_names) -- kept simple for this first version;
+    add it the same way (one level, capped) if nested-link content turns
+    out to need mismatch checking too."""
+    elements = []
+    if link_doc is None:
+        return elements
+
+    type_cache = {}  # type_id (int) -> is_concrete
+    concrete_kw = cfg.get(u"ConcreteKeywords") or []
+    exclude_kw  = cfg.get(u"ExcludeKeywords") or []
+
+    for bic in categories:
+        try:
+            elems = (DB.FilteredElementCollector(link_doc)
+                       .OfCategory(bic)
+                       .WhereElementIsNotElementType()
+                       .ToElements())
+        except Exception:
+            continue
+        is_wall = (bic == DB.BuiltInCategory.OST_Walls)
+
+        for elem in elems:
+            try:
+                type_id = elem.GetTypeId()
+            except Exception:
+                continue
+            if type_id is None or type_id == DB.ElementId.InvalidElementId:
+                continue
+
+            key = type_id.IntegerValue
+            if key not in type_cache:
+                elem_type = link_doc.GetElement(type_id)
+                is_conc = False
+                if elem_type is not None:
+                    try:
+                        is_conc = _type_is_concrete(link_doc, elem_type, bic, cfg)
+                    except Exception:
+                        is_conc = False
+                type_cache[key] = is_conc
+            is_conc = type_cache[key]
+
+            if not is_conc and not is_wall:
+                try:
+                    inst_texts = _instance_material_texts(link_doc, elem)
+                    if inst_texts:
+                        combined = u" | ".join(inst_texts)
+                        if (_contains_any(combined, concrete_kw)
+                                and not _contains_any(combined, exclude_kw)):
+                            is_conc = True
+                except Exception:
+                    pass
+
+            if is_conc:
+                elements.append(elem)
+
+    return elements
+
+
+def _transformed_2d_bbox(elem, transform):
+    """(min_x, min_y, max_x, max_y) of elem's BoundingBox in HOST document
+    coordinates, or None if it has none. Transforms all 8 corners (not just
+    Min/Max) before taking the axis-aligned min/max -- a link rotated
+    relative to the host would otherwise give a wrong, un-rotated box if
+    only the two corner points were transformed directly."""
+    try:
+        bbox = elem.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+    if bbox is None:
+        return None
+    mn, mx = bbox.Min, bbox.Max
+    corners = [
+        DB.XYZ(mn.X, mn.Y, mn.Z), DB.XYZ(mx.X, mn.Y, mn.Z),
+        DB.XYZ(mn.X, mx.Y, mn.Z), DB.XYZ(mx.X, mx.Y, mn.Z),
+        DB.XYZ(mn.X, mn.Y, mx.Z), DB.XYZ(mx.X, mn.Y, mx.Z),
+        DB.XYZ(mn.X, mx.Y, mx.Z), DB.XYZ(mx.X, mx.Y, mx.Z),
+    ]
+    try:
+        pts = [transform.OfPoint(c) for c in corners]
+    except Exception:
+        return None
+    xs = [p.X for p in pts]
+    ys = [p.Y for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def detect_2d_mismatches(doc, arch_link, struct_link, tolerance_ft, override_bics, settings):
+    """For every concrete Structure element (get_concrete_elements on
+    struct_link), find the best-overlapping concrete Architecture element
+    (get_concrete_elements on arch_link) within tolerance_ft of each other
+    in plan (host-coordinate 2D footprint, via _transformed_2d_bbox) and
+    flag an issue dict if either (a) no Architecture element overlaps it
+    at all within tolerance, or (b) one does, but its footprint still
+    differs from Structure's by more than tolerance_ft in some direction
+    (e.g. same column grid position, different size/edge). "Best" match
+    = largest 2D overlap area, so a nearby-but-unrelated element doesn't
+    win over the one actually coordinating with this Structure element.
+    Only Structure elements are walked (not the reverse) -- an
+    Architecture element with no Structure counterpart at all (e.g. a
+    partition wall) isn't a structural coordination issue."""
+    issues = []
+    arch_doc    = arch_link.get(u"doc")
+    struct_doc  = struct_link.get(u"doc")
+    arch_inst   = arch_link.get(u"instance")
+    struct_inst = struct_link.get(u"instance")
+    if arch_doc is None or struct_doc is None or arch_inst is None or struct_inst is None:
+        return issues
+
+    try:
+        arch_transform = arch_inst.GetTotalTransform()
+        struct_transform = struct_inst.GetTotalTransform()
+    except Exception:
+        return issues
+
+    arch_boxes = []
+    for elem in get_concrete_elements(arch_doc, override_bics, settings):
+        box = _transformed_2d_bbox(elem, arch_transform)
+        if box is not None:
+            arch_boxes.append((elem, box))
+
+    for struct_elem in get_concrete_elements(struct_doc, override_bics, settings):
+        struct_box = _transformed_2d_bbox(struct_elem, struct_transform)
+        if struct_box is None:
+            continue
+        smin_x, smin_y, smax_x, smax_y = struct_box
+
+        best_arch, best_box, best_area = None, None, -1.0
+        for arch_elem, arch_box in arch_boxes:
+            amin_x, amin_y, amax_x, amax_y = arch_box
+            if (amax_x + tolerance_ft < smin_x or smax_x + tolerance_ft < amin_x or
+                    amax_y + tolerance_ft < smin_y or smax_y + tolerance_ft < amin_y):
+                continue  # not even within tolerance of overlapping — not a candidate at all
+            ox = min(amax_x, smax_x) - max(amin_x, smin_x)
+            oy = min(amax_y, smax_y) - max(amin_y, smin_y)
+            area = max(ox, 0.0) * max(oy, 0.0)
+            if area > best_area:
+                best_arch, best_box, best_area = arch_elem, arch_box, area
+
+        center = ((smin_x + smax_x) / 2.0, (smin_y + smax_y) / 2.0)
+
+        if best_arch is None:
+            issues.append({
+                u"type": u"missing_architecture",
+                u"struct_elem": struct_elem, u"arch_elem": None,
+                u"struct_box": struct_box, u"arch_box": None, u"center": center,
+                u"title": u"Structure element with no matching Architecture element",
+                u"description": (
+                    u"Structure element Id {} (Category: {}) has no concrete Architecture "
+                    u"element within {:.2f} ft of it.".format(
+                        struct_elem.Id.IntegerValue,
+                        _elem_name(struct_elem.Category) if struct_elem.Category else u"?",
+                        tolerance_ft)),
+            })
+            continue
+
+        amin_x, amin_y, amax_x, amax_y = best_box
+        delta = max(abs(smin_x - amin_x), abs(smin_y - amin_y),
+                    abs(smax_x - amax_x), abs(smax_y - amax_y))
+        if delta > tolerance_ft:
+            issues.append({
+                u"type": u"footprint_mismatch",
+                u"struct_elem": struct_elem, u"arch_elem": best_arch,
+                u"struct_box": struct_box, u"arch_box": best_box, u"center": center,
+                u"title": u"Structure/Architecture footprint mismatch",
+                u"description": (
+                    u"Structure element Id {} and Architecture element Id {} overlap, but "
+                    u"their 2D footprints differ by {:.2f} ft in at least one direction "
+                    u"(tolerance {:.2f} ft).".format(
+                        struct_elem.Id.IntegerValue, best_arch.Id.IntegerValue,
+                        delta, tolerance_ft)),
+            })
+
+    return issues
+
+
+def export_mismatches_to_bcf(mismatches, save_path):
+    """Minimal, best-effort BCF 2.1 export — one Topic per mismatch, zipped
+    per the BCF 2.1 folder layout (bcf.version + one GUID folder per topic
+    holding markup.bcf + viewpoint.bcfv). NOT validated against the
+    official BCF 2.1 XSD or a real BCF reader/ACC import — in particular,
+    <SheetName> is NOT part of the standard BCF 2.1 schema at all; it's
+    included only because ACC/BIM 360 is reported to use it to place a 2D
+    pushpin on a specific sheet. Confirm a real import actually does that
+    before relying on this for anything more than a rough visual record."""
+    BCF_NS = u"http://www.buildingsmart-tech.org/specifications/BCF-XML"
+    now_iso = datetime.datetime.utcnow().strftime(u"%Y-%m-%dT%H:%M:%SZ")
+
+    zf = zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED)
+    try:
+        version_root = ET.Element(u"Version", {u"xmlns": BCF_NS, u"VersionId": u"2.1"})
+        zf.writestr(u"bcf.version", ET.tostring(version_root, encoding=u"utf-8"))
+
+        for issue in mismatches:
+            guid = str(uuid.uuid4())
+            view_name = issue.get(u"view_name")
+            sheet_number = issue.get(u"sheet_number")
+            sheet_or_view = sheet_number or view_name
+
+            markup = ET.Element(u"Markup", {u"xmlns": BCF_NS})
+            topic = ET.SubElement(markup, u"Topic", {
+                u"Guid": guid, u"TopicType": u"Clash", u"TopicStatus": u"Open"})
+            ET.SubElement(topic, u"Title").text = issue.get(u"title") or u"2D Mismatch"
+            ET.SubElement(topic, u"Description").text = issue.get(u"description") or u""
+            ET.SubElement(topic, u"CreationDate").text = now_iso
+            ET.SubElement(topic, u"CreationAuthor").text = u"EasyBIM Coordination Graphics"
+            if sheet_or_view:
+                ET.SubElement(topic, u"SheetName").text = sheet_or_view
+            zf.writestr(u"{}/markup.bcf".format(guid), ET.tostring(markup, encoding=u"utf-8"))
+
+            center = issue.get(u"center") or (0.0, 0.0)
+            viz = ET.Element(u"VisualizationInfo", {u"xmlns": BCF_NS, u"Guid": guid})
+            cam = ET.SubElement(viz, u"OrthogonalCamera")
+            view_point = ET.SubElement(cam, u"CameraViewPoint")
+            ET.SubElement(view_point, u"X").text = str(center[0])
+            ET.SubElement(view_point, u"Y").text = str(center[1])
+            ET.SubElement(view_point, u"Z").text = u"0"
+            direction = ET.SubElement(cam, u"CameraDirection")
+            ET.SubElement(direction, u"X").text = u"0"
+            ET.SubElement(direction, u"Y").text = u"0"
+            ET.SubElement(direction, u"Z").text = u"-1"
+            up_vec = ET.SubElement(cam, u"CameraUpVector")
+            ET.SubElement(up_vec, u"X").text = u"0"
+            ET.SubElement(up_vec, u"Y").text = u"1"
+            ET.SubElement(up_vec, u"Z").text = u"0"
+            ET.SubElement(cam, u"ViewToWorldScale").text = u"1"
+            if sheet_or_view:
+                ET.SubElement(viz, u"Document").text = sheet_or_view
+            zf.writestr(u"{}/viewpoint.bcfv".format(guid), ET.tostring(viz, encoding=u"utf-8"))
+    finally:
+        zf.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VIEW FILTERS  (Step 8C/8D)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4123,6 +4386,7 @@ def run():
     # case, just re-run that one view" tolerance this batch mode was built
     # around, instead of one giant all-or-nothing transaction.
     view_results = []
+    all_mismatches = []
     for view in selected_views:
         vr = {
             u"name": _elem_name(view), u"warnings": [], u"sheet": None,
@@ -4246,6 +4510,25 @@ def run():
                 if view_for_sheet is not None:
                     vr[u"sheet"] = _create_and_place_sheet(
                         view_for_sheet, _elem_name(view_for_sheet), titleblock_symbol, w)
+
+            # ── Refinement 3: 2D mismatch detection (Structure vs Architecture) ─
+            # Runs per view (not hoisted into the shared t0 setup like the
+            # deep-scan above) specifically so each mismatch can be tagged with
+            # THIS view's name/sheet for BCF export below — read-only (no
+            # document edits), so it needs no transaction of its own and any
+            # exception here is caught by this view's own except block below,
+            # same as everything else in this try. Every Architecture/
+            # Structure link COMBINATION selected for this batch is checked,
+            # not just the first of each.
+            sheet_number = vr[u"sheet"].SheetNumber if vr[u"sheet"] is not None else None
+            for arch_li in arch_links:
+                for struct_li in struct_links:
+                    view_issues = detect_2d_mismatches(
+                        doc, arch_li, struct_li, MISMATCH_2D_TOLERANCE_FT, override_bics, settings)
+                    for issue in view_issues:
+                        issue[u"view_name"] = vr[u"name"]
+                        issue[u"sheet_number"] = sheet_number
+                    all_mismatches.extend(view_issues)
 
             # ── Step 5: hide every other link (e.g. MEP) ────────────────────────
             # Runs LAST, after the template/filter work above — see the
@@ -4414,6 +4697,22 @@ def run():
     elif total_warnings:
         title = u"EasyBIM — Coordination Graphics — Done, with warnings"
     TaskDialog.Show(title, body)
+
+    # ── 2D mismatch export (BCF 2.1) ────────────────────────────────────────
+    if all_mismatches:
+        save_path = forms.save_file(file_ext=u"bcfzip", default_name=u"coordination_mismatches.bcfzip")
+        if save_path:
+            try:
+                export_mismatches_to_bcf(all_mismatches, save_path)
+                TaskDialog.Show(
+                    u"EasyBIM — Coordination Graphics — BCF Export",
+                    u"{} 2D mismatch(es) found across {} view(s) — exported to:\n{}".format(
+                        len(all_mismatches), len(view_results), save_path))
+            except Exception:
+                TaskDialog.Show(
+                    u"EasyBIM — Coordination Graphics — BCF Export Failed",
+                    u"{} mismatch(es) were found, but the BCF export failed:\n\n{}".format(
+                        len(all_mismatches), traceback.format_exc()))
 
 
 def main():
