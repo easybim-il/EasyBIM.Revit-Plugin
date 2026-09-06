@@ -3734,38 +3734,106 @@ def are_pattern_angles_colliding(doc, id1, id2):
     return abs(angle1 - angle2) < 0.01
 
 
-def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
+def get_rotated_pattern_id(doc, original_id, angle_degrees=90.0):
     """Auto-fix for are_pattern_angles_colliding: a colliding pattern isn't
     fixable from this tool's own Settings (it's Revit project data), so
     instead of just warning, create (or reuse) a rotated COPY of the
     pattern -- never rotate the original in place, since other elements
-    in the model may already legitimately rely on its current angle."""
+    in the model may already legitimately rely on its current angle.
+
+    angle_degrees defaults to 90, NOT 45: rotating any line by 90 degrees
+    always gives a perpendicular line, which can never coincide with the
+    original at any starting angle (found live: the first version of this
+    used 45, which for a pattern already at 45 degrees produces 90 --
+    i.e. a plain vertical line, not a diagonal at all, since 45+45=90).
+    A "mirror" transform (angle -> 180-angle) was considered instead --
+    it matches Revit's own "Diagonal down" (135) for a 45-degree "Diagonal
+    up" input -- but rejected because it has a real degenerate case: at
+    exactly 0 or 90 degrees, 180-angle lands back on the SAME angle
+    (0->180==0, 90->90), silently failing to resolve the collision it was
+    supposed to fix. +90 has no such blind spot for any input angle.
+
+    BUG FOUND LIVE: building a blank `DB.FillPattern()`, setting `.Name`
+    on it, then calling `.SetFillGrids(...)` and only THEN
+    `FillPatternElement.Create(doc, new_fp)` reliably threw "fillPattern
+    does not have a valid Name" from Create() itself -- something about
+    that order (most likely SetFillGrids on a still-unattached FillPattern
+    resetting/discarding whatever was assigned before it) leaves Name
+    unset by the time Create() validates it. Every real Structure/
+    Architecture diagonal pattern seen so far (Diagonal up/down 1.5mm) is
+    a single FillGrid with no dash Segments, which is exactly what
+    Revit's own `FillPattern(name, target, hostOrientation, angle,
+    spacing)` constructor is for -- name is part of construction, not a
+    property set afterward, so there's no ordering pitfall to hit at all.
+    Used for that common case; the manual FillGrid-rebuilding path (still
+    needed for a multi-grid pattern, e.g. a cross-hatch, or one with dash
+    Segments, neither of which that simpler constructor can express) is
+    kept as a fallback, with Name set LAST as a defensive measure against
+    the same suspected ordering issue -- unverified live, since no
+    multi-grid Structure/Architecture pattern has been seen in practice.
+
+    A prior run with the buggy 45-degree default may already have created
+    (and this function would otherwise keep reusing, by name alone) a
+    "*_Rotated45" pattern that's rotated by the WRONG amount -- so an
+    existing same-named pattern's actual angle(s) are compared against
+    what rotating original_id's CURRENT angle by angle_degrees would
+    produce, not against whether it merely "collides with original_id"
+    (found live: it always doesn't, for any nonzero angle_degrees,
+    regardless of whether that rotation amount was ever the intended
+    one -- comparing against original_id instead of the actual target
+    angle let a stale wrong-angle copy get silently reused forever,
+    since it also happened to differ from original_id, just not by the
+    amount actually needed). Rebuilt via SetFillPattern (proven live, see
+    build_colored_override's sibling fix this same day) if it doesn't
+    match; only trusted as-is if its angle(s) already do."""
     original_fpe = doc.GetElement(original_id)
+    original_fp = original_fpe.GetFillPattern()
     original_name = _elem_name(original_fpe)
     rotated_name = original_name + u"_Rotated45"
+    angle_offset = math.radians(angle_degrees)
+    grids = list(original_fp.GetFillGrids())
+    target_angles = tuple(sorted(
+        int(round((g.Angle + angle_offset) * 180.0 / math.pi)) % 180 for g in grids))
 
+    existing_fpe = None
     for fpe in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement):
         if _elem_name(fpe) == rotated_name:
-            return fpe.Id
+            existing_fpe = fpe
+            break
 
-    original_fp = original_fpe.GetFillPattern()
-    new_fp = DB.FillPattern()
-    new_fp.Name = rotated_name
-    new_fp.Target = original_fp.Target
-    new_fp.HostOrientation = original_fp.HostOrientation
+    if existing_fpe is not None:
+        existing_angles = tuple(sorted(
+            int(round(eg.Angle * 180.0 / math.pi)) % 180
+            for eg in existing_fpe.GetFillPattern().GetFillGrids()))
+        if existing_angles == target_angles:
+            return existing_fpe.Id
 
-    new_grids = []
-    for g in original_fp.GetFillGrids():
-        ng = DB.FillGrid()
-        ng.Origin = g.Origin
-        ng.Angle = g.Angle + math.radians(angle_degrees)
-        ng.Offset = g.Offset
-        ng.Shift = g.Shift
-        segs = list(g.GetSegments())
-        if segs:
-            ng.SetSegments(segs)
-        new_grids.append(ng)
-    new_fp.SetFillGrids(new_grids)
+    if len(grids) == 1 and not list(grids[0].GetSegments()):
+        g = grids[0]
+        new_fp = DB.FillPattern(
+            rotated_name, original_fp.Target, original_fp.HostOrientation,
+            g.Angle + angle_offset, g.Offset)
+    else:
+        new_fp = DB.FillPattern()
+        new_fp.Target = original_fp.Target
+        new_fp.HostOrientation = original_fp.HostOrientation
+        new_grids = []
+        for g in grids:
+            ng = DB.FillGrid()
+            ng.Origin = g.Origin
+            ng.Angle = g.Angle + angle_offset
+            ng.Offset = g.Offset
+            ng.Shift = g.Shift
+            segs = list(g.GetSegments())
+            if segs:
+                ng.SetSegments(segs)
+            new_grids.append(ng)
+        new_fp.SetFillGrids(new_grids)
+        new_fp.Name = rotated_name
+
+    if existing_fpe is not None:
+        existing_fpe.SetFillPattern(new_fp)
+        return existing_fpe.Id
 
     new_fpe = DB.FillPatternElement.Create(doc, new_fp)
     return new_fpe.Id
@@ -4378,7 +4446,7 @@ def run():
         if are_pattern_angles_colliding(doc, struct_fill_id, arch_fill_id):
             global_warnings.append(
                 u"Structure's and Architecture's hatch patterns draw at the same angle — "
-                u"auto-fixed by rotating a copy of Structure's pattern 45 degrees (created/"
+                u"auto-fixed by rotating a copy of Structure's pattern 90 degrees (created/"
                 u"reused '{}_Rotated45').".format(_elem_name(doc.GetElement(struct_fill_id))))
             struct_fill_id = get_rotated_pattern_id(doc, struct_fill_id)
 
