@@ -3443,17 +3443,26 @@ def get_rotated_pattern_id(doc, original_id, angle_degrees=90.0):
 
     A prior run with the buggy 45-degree default may already have created
     (and this function would otherwise keep reusing, by name alone) a
-    "*_Rotated45" pattern that's STILL colliding with the original -- so
-    an existing same-named pattern is only reused if it actually no
-    longer collides; otherwise it's corrected in place via SetFillPattern
-    (proven live, see build_colored_override's sibling fix this same
-    day) instead of blindly trusted just because the name matches."""
+    "*_Rotated45" pattern that's rotated by the WRONG amount -- so an
+    existing same-named pattern's actual angle(s) are compared against
+    what rotating original_id's CURRENT angle by angle_degrees would
+    produce, not against whether it merely "collides with original_id"
+    (found live: it always doesn't, for any nonzero angle_degrees,
+    regardless of whether that rotation amount was ever the intended
+    one -- comparing against original_id instead of the actual target
+    angle let a stale wrong-angle copy get silently reused forever,
+    since it also happened to differ from original_id, just not by the
+    amount actually needed). Rebuilt via SetFillPattern (proven live, see
+    build_colored_override's sibling fix this same day) if it doesn't
+    match; only trusted as-is if its angle(s) already do."""
     original_fpe = doc.GetElement(original_id)
     original_fp = original_fpe.GetFillPattern()
     original_name = _elem_name(original_fpe)
     rotated_name = original_name + u"_Rotated45"
     angle_offset = math.radians(angle_degrees)
     grids = list(original_fp.GetFillGrids())
+    target_angles = tuple(sorted(
+        int(round((g.Angle + angle_offset) * 180.0 / math.pi)) % 180 for g in grids))
 
     existing_fpe = None
     for fpe in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement):
@@ -3461,9 +3470,12 @@ def get_rotated_pattern_id(doc, original_id, angle_degrees=90.0):
             existing_fpe = fpe
             break
 
-    if existing_fpe is not None and not are_pattern_angles_colliding(
-            doc, original_id, existing_fpe.Id):
-        return existing_fpe.Id
+    if existing_fpe is not None:
+        existing_angles = tuple(sorted(
+            int(round(eg.Angle * 180.0 / math.pi)) % 180
+            for eg in existing_fpe.GetFillPattern().GetFillGrids()))
+        if existing_angles == target_angles:
+            return existing_fpe.Id
 
     if len(grids) == 1 and not list(grids[0].GetSegments()):
         g = grids[0]
