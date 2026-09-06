@@ -221,6 +221,7 @@ __author__ = "EasyBIM"
 __doc__ = "Color-code concrete Walls/Columns/Framing/Foundations in the Architecture and Structure links via View Filters."
 
 import clr
+import math
 import re
 import traceback
 
@@ -3376,6 +3377,54 @@ def find_fill_pattern_id(exact_name, warnings, label):
     return DB.ElementId.InvalidElementId
 
 
+def _fill_pattern_angle_signature(fill_id):
+    """Sorted tuple of a FillPatternElement's own FillGrid angles (rounded
+    to the nearest degree, mod 180 since a line at angle A looks identical
+    to one at A+180), or None if fill_id doesn't resolve. Two Fill Patterns
+    can have different names/ids yet be geometrically identical — found
+    live: a project's custom "Diagonal down 1.5mm" turned out to be a
+    byte-for-byte copy of "Diagonal up 1.5mm" (same 45° angle) because
+    whoever authored it duplicated the other pattern and never actually
+    flipped the angle. find_fill_pattern_id's name-based resolution has no
+    way to catch that — it correctly finds two distinct, correctly-named
+    elements — so this compares actual geometry instead, letting
+    warn_if_hatches_collide below catch the case name resolution can't."""
+    if fill_id is None or fill_id == DB.ElementId.InvalidElementId:
+        return None
+    try:
+        fp = doc.GetElement(fill_id).GetFillPattern()
+        if fp is None:
+            return None
+        return tuple(sorted(
+            int(round(g.Angle * 180.0 / math.pi)) % 180 for g in fp.GetFillGrids()))
+    except Exception:
+        return None
+
+
+def warn_if_hatches_collide(struct_fill_id, arch_fill_id, warnings):
+    """Structure and Architecture are meant to read as two visually
+    distinct diagonal hatches. If their resolved Fill Patterns happen to
+    share the same actual angle(s) -- same id, or two different ids that
+    were authored identically -- they will render identically in the
+    view even though everything about the Settings/resolution is correct.
+    Surface that as a concrete, actionable warning in the results dialog
+    (where the user will actually see it) instead of leaving it as a
+    silent visual mismatch discoverable only by eyeballing a plan."""
+    struct_sig = _fill_pattern_angle_signature(struct_fill_id)
+    arch_sig = _fill_pattern_angle_signature(arch_fill_id)
+    if not struct_sig or not arch_sig or struct_sig != arch_sig:
+        return
+    struct_name = _elem_name(doc.GetElement(struct_fill_id))
+    arch_name = _elem_name(doc.GetElement(arch_fill_id))
+    warnings.append(
+        u"Structure's hatch ('{}') and Architecture's hatch ('{}') are different Fill "
+        u"Patterns but draw at the same angle, so they will look identical in the view. "
+        u"This isn't fixable from these Settings — open Manage > Additional Settings > "
+        u"Fill Patterns in Revit, edit one of the two patterns, and change its angle "
+        u"(commonly 45 <-> 135 degrees for a mirrored diagonal).".format(
+            struct_name, arch_name))
+
+
 def _settings_color(settings, key, fallback):
     c = settings.get(key) or {}
     try:
@@ -3529,7 +3578,7 @@ def build_colored_override(color, pattern_name, warnings, label):
             u"tints the element's own default pattern instead — often Solid fill, exactly "
             u"the opaque-block bug) — only the cut/projection LINE colors were applied.".format(label))
 
-    return ogs
+    return ogs, fill_id
 
 
 def build_grid_line_override(color, warnings, label):
@@ -3977,10 +4026,11 @@ def run():
         struct_color = _settings_color(settings, u"StructColor", DB.Color(200, 30, 30))
         arch_color   = _settings_color(settings, u"ArchColor", DB.Color(0, 70, 200))
 
-        struct_ogs = build_colored_override(struct_color, settings.get(u"StructPatternName"),
-                                             global_warnings, u"Structure")
-        arch_ogs   = build_colored_override(arch_color, settings.get(u"ArchPatternName"),
-                                             global_warnings, u"Architecture")
+        struct_ogs, struct_fill_id = build_colored_override(
+            struct_color, settings.get(u"StructPatternName"), global_warnings, u"Structure")
+        arch_ogs, arch_fill_id = build_colored_override(
+            arch_color, settings.get(u"ArchPatternName"), global_warnings, u"Architecture")
+        warn_if_hatches_collide(struct_fill_id, arch_fill_id, global_warnings)
         struct_grid_ogs = build_grid_line_override(struct_color, global_warnings, u"Structure")
         arch_grid_ogs   = build_grid_line_override(arch_color, global_warnings, u"Architecture")
 
