@@ -221,6 +221,7 @@ __author__ = "EasyBIM"
 __doc__ = "Color-code concrete Walls/Columns/Framing/Foundations in the Architecture and Structure links via View Filters."
 
 import clr
+import math
 import re
 import traceback
 
@@ -3376,6 +3377,69 @@ def find_fill_pattern_id(exact_name, warnings, label):
     return DB.ElementId.InvalidElementId
 
 
+def are_pattern_angles_colliding(doc, id1, id2):
+    """True if two resolved Fill Patterns would draw at the same angle
+    (mod pi -- a line at angle A looks identical to one at A + pi) within
+    a small tolerance, i.e. they'd look like the same hatch in the view
+    even though they're two distinct, correctly-named patterns. Found
+    live: a project's custom "Diagonal down 1.5mm" turned out to be a
+    byte-for-byte copy of "Diagonal up 1.5mm" (same 45° angle) because
+    whoever authored it duplicated the other pattern and never actually
+    flipped the angle -- find_fill_pattern_id's name-based resolution has
+    no way to catch that, since it correctly finds two distinct elements;
+    only comparing actual geometry does. Only the first FillGrid is
+    compared -- true of every Structure/Architecture diagonal pattern
+    seen so far, all single-grid."""
+    if id1 == DB.ElementId.InvalidElementId or id2 == DB.ElementId.InvalidElementId:
+        return False
+    fp1 = doc.GetElement(id1).GetFillPattern()
+    fp2 = doc.GetElement(id2).GetFillPattern()
+    grids1 = list(fp1.GetFillGrids())
+    grids2 = list(fp2.GetFillGrids())
+    if not grids1 or not grids2:
+        return False
+    angle1 = grids1[0].Angle % math.pi
+    angle2 = grids2[0].Angle % math.pi
+    return abs(angle1 - angle2) < 0.01
+
+
+def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
+    """Auto-fix for are_pattern_angles_colliding: a colliding pattern isn't
+    fixable from this tool's own Settings (it's Revit project data), so
+    instead of just warning, create (or reuse) a rotated COPY of the
+    pattern -- never rotate the original in place, since other elements
+    in the model may already legitimately rely on its current angle."""
+    original_fpe = doc.GetElement(original_id)
+    original_name = _elem_name(original_fpe)
+    rotated_name = original_name + u"_Rotated45"
+
+    for fpe in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement):
+        if _elem_name(fpe) == rotated_name:
+            return fpe.Id
+
+    original_fp = original_fpe.GetFillPattern()
+    new_fp = DB.FillPattern()
+    new_fp.Name = rotated_name
+    new_fp.Target = original_fp.Target
+    new_fp.HostOrientation = original_fp.HostOrientation
+
+    new_grids = []
+    for g in original_fp.GetFillGrids():
+        ng = DB.FillGrid()
+        ng.Origin = g.Origin
+        ng.Angle = g.Angle + math.radians(angle_degrees)
+        ng.Offset = g.Offset
+        ng.Shift = g.Shift
+        segs = list(g.GetSegments())
+        if segs:
+            ng.SetSegments(segs)
+        new_grids.append(ng)
+    new_fp.SetFillGrids(new_grids)
+
+    new_fpe = DB.FillPatternElement.Create(doc, new_fp)
+    return new_fpe.Id
+
+
 def _settings_color(settings, key, fallback):
     c = settings.get(key) or {}
     try:
@@ -3384,7 +3448,7 @@ def _settings_color(settings, key, fallback):
         return fallback
 
 
-def build_colored_override(color, pattern_name, warnings, label):
+def build_colored_override(color, resolved_fill_id, warnings, label):
     """Cut AND Surface/Projection, both hatched — Surface was dropped
     entirely a few rounds back (elements were rendering as 100% solid,
     opaque colored blocks), then live-testing found a DIFFERENT symptom
@@ -3503,8 +3567,8 @@ def build_colored_override(color, pattern_name, warnings, label):
     except Exception as ex:
         warnings.append(u"{}: could not enable the surface foreground pattern: {}".format(label, ex))
 
-    # ── Shared hatch pattern (resolved once, applied to both) ──────────
-    fill_id = find_fill_pattern_id(pattern_name, warnings, label)
+    # ── Shared hatch pattern (resolved by the caller, applied here) ────
+    fill_id = resolved_fill_id
     if fill_id != DB.ElementId.InvalidElementId:
         try:
             ogs.SetCutForegroundPatternId(fill_id)
@@ -3977,10 +4041,18 @@ def run():
         struct_color = _settings_color(settings, u"StructColor", DB.Color(200, 30, 30))
         arch_color   = _settings_color(settings, u"ArchColor", DB.Color(0, 70, 200))
 
-        struct_ogs = build_colored_override(struct_color, settings.get(u"StructPatternName"),
-                                             global_warnings, u"Structure")
-        arch_ogs   = build_colored_override(arch_color, settings.get(u"ArchPatternName"),
-                                             global_warnings, u"Architecture")
+        struct_fill_id = find_fill_pattern_id(settings.get(u"StructPatternName"), global_warnings, u"Structure")
+        arch_fill_id   = find_fill_pattern_id(settings.get(u"ArchPatternName"), global_warnings, u"Architecture")
+
+        if are_pattern_angles_colliding(doc, struct_fill_id, arch_fill_id):
+            global_warnings.append(
+                u"Structure's and Architecture's hatch patterns draw at the same angle — "
+                u"auto-fixed by rotating a copy of Structure's pattern 45 degrees (created/"
+                u"reused '{}_Rotated45').".format(_elem_name(doc.GetElement(struct_fill_id))))
+            struct_fill_id = get_rotated_pattern_id(doc, struct_fill_id)
+
+        struct_ogs = build_colored_override(struct_color, struct_fill_id, global_warnings, u"Structure")
+        arch_ogs   = build_colored_override(arch_color, arch_fill_id, global_warnings, u"Architecture")
         struct_grid_ogs = build_grid_line_override(struct_color, global_warnings, u"Structure")
         arch_grid_ogs   = build_grid_line_override(arch_color, global_warnings, u"Architecture")
 
