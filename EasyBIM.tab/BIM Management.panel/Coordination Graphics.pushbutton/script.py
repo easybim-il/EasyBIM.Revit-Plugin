@@ -3403,12 +3403,24 @@ def are_pattern_angles_colliding(doc, id1, id2):
     return abs(angle1 - angle2) < 0.01
 
 
-def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
+def get_rotated_pattern_id(doc, original_id, angle_degrees=90.0):
     """Auto-fix for are_pattern_angles_colliding: a colliding pattern isn't
     fixable from this tool's own Settings (it's Revit project data), so
     instead of just warning, create (or reuse) a rotated COPY of the
     pattern -- never rotate the original in place, since other elements
     in the model may already legitimately rely on its current angle.
+
+    angle_degrees defaults to 90, NOT 45: rotating any line by 90 degrees
+    always gives a perpendicular line, which can never coincide with the
+    original at any starting angle (found live: the first version of this
+    used 45, which for a pattern already at 45 degrees produces 90 --
+    i.e. a plain vertical line, not a diagonal at all, since 45+45=90).
+    A "mirror" transform (angle -> 180-angle) was considered instead --
+    it matches Revit's own "Diagonal down" (135) for a 45-degree "Diagonal
+    up" input -- but rejected because it has a real degenerate case: at
+    exactly 0 or 90 degrees, 180-angle lands back on the SAME angle
+    (0->180==0, 90->90), silently failing to resolve the collision it was
+    supposed to fix. +90 has no such blind spot for any input angle.
 
     BUG FOUND LIVE: building a blank `DB.FillPattern()`, setting `.Name`
     on it, then calling `.SetFillGrids(...)` and only THEN
@@ -3427,18 +3439,31 @@ def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
     Segments, neither of which that simpler constructor can express) is
     kept as a fallback, with Name set LAST as a defensive measure against
     the same suspected ordering issue -- unverified live, since no
-    multi-grid Structure/Architecture pattern has been seen in practice."""
+    multi-grid Structure/Architecture pattern has been seen in practice.
+
+    A prior run with the buggy 45-degree default may already have created
+    (and this function would otherwise keep reusing, by name alone) a
+    "*_Rotated45" pattern that's STILL colliding with the original -- so
+    an existing same-named pattern is only reused if it actually no
+    longer collides; otherwise it's corrected in place via SetFillPattern
+    (proven live, see build_colored_override's sibling fix this same
+    day) instead of blindly trusted just because the name matches."""
     original_fpe = doc.GetElement(original_id)
+    original_fp = original_fpe.GetFillPattern()
     original_name = _elem_name(original_fpe)
     rotated_name = original_name + u"_Rotated45"
+    angle_offset = math.radians(angle_degrees)
+    grids = list(original_fp.GetFillGrids())
 
+    existing_fpe = None
     for fpe in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement):
         if _elem_name(fpe) == rotated_name:
-            return fpe.Id
+            existing_fpe = fpe
+            break
 
-    original_fp = original_fpe.GetFillPattern()
-    grids = list(original_fp.GetFillGrids())
-    angle_offset = math.radians(angle_degrees)
+    if existing_fpe is not None and not are_pattern_angles_colliding(
+            doc, original_id, existing_fpe.Id):
+        return existing_fpe.Id
 
     if len(grids) == 1 and not list(grids[0].GetSegments()):
         g = grids[0]
@@ -3462,6 +3487,10 @@ def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
             new_grids.append(ng)
         new_fp.SetFillGrids(new_grids)
         new_fp.Name = rotated_name
+
+    if existing_fpe is not None:
+        existing_fpe.SetFillPattern(new_fp)
+        return existing_fpe.Id
 
     new_fpe = DB.FillPatternElement.Create(doc, new_fp)
     return new_fpe.Id
@@ -4074,7 +4103,7 @@ def run():
         if are_pattern_angles_colliding(doc, struct_fill_id, arch_fill_id):
             global_warnings.append(
                 u"Structure's and Architecture's hatch patterns draw at the same angle — "
-                u"auto-fixed by rotating a copy of Structure's pattern 45 degrees (created/"
+                u"auto-fixed by rotating a copy of Structure's pattern 90 degrees (created/"
                 u"reused '{}_Rotated45').".format(_elem_name(doc.GetElement(struct_fill_id))))
             struct_fill_id = get_rotated_pattern_id(doc, struct_fill_id)
 
