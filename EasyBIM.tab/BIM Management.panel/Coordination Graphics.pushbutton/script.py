@@ -239,7 +239,8 @@ clr.AddReference('System')
 
 from Autodesk.Revit import DB
 from Autodesk.Revit.DB import Structure
-from Autodesk.Revit.UI import TaskDialog
+from Autodesk.Revit.UI import (
+    TaskDialog, TaskDialogCommandLinkId, TaskDialogCommonButtons, TaskDialogResult)
 
 import System
 import System.Collections.Generic as SCG
@@ -3279,6 +3280,73 @@ def export_mismatches_to_bcf(mismatches, save_path):
         zf.close()
 
 
+ACC_ISSUES_CSV_HEADER = [
+    u"Title (Required)", u"Status", u"Category", u"Type", u"Description",
+    u"Assigned To", u"Location", u"Location details",
+    u"Due Date (YYYY-MM-DD format)", u"Start Date (YYYY-MM-DD format)",
+    u"Root Cause Category", u"Root Cause",
+]
+
+
+def _csv_field(value):
+    text = value if isinstance(value, basestring) else unicode(value)
+    text = text.replace(u'"', u'""')
+    if any(ch in text for ch in (u',', u'"', u'\n', u'\r')):
+        return u'"{}"'.format(text)
+    return text
+
+
+def _mismatch_location_details(issue):
+    parts = []
+    struct_elem = issue.get(u"struct_elem")
+    arch_elem = issue.get(u"arch_elem")
+    if struct_elem is not None:
+        parts.append(u"Structure Id {}".format(struct_elem.Id.IntegerValue))
+    if arch_elem is not None:
+        parts.append(u"Architecture Id {}".format(arch_elem.Id.IntegerValue))
+    return u", ".join(parts)
+
+
+def export_mismatches_to_csv(mismatches, save_path):
+    """Same 12-column layout as ACC's own bulk Issues import template (see
+    tools/acc_issues_export.py, built earlier for the same purpose as a
+    standalone script) -- CSV instead of a real .xlsx specifically for
+    this in-Revit button, since IronPython has no reliable, dependency-
+    free way to write genuine OOXML .xlsx, and requiring every team
+    member to separately install a matching CPython3 + openpyxl just to
+    click one button here isn't worth the fragility. Written with a UTF-8
+    BOM (every field may contain Hebrew, e.g. type/category names) so
+    Excel auto-detects the encoding correctly on a plain double-click
+    instead of showing mojibake."""
+    rows = [ACC_ISSUES_CSV_HEADER]
+    for issue in mismatches:
+        issue_type = issue.get(u"type")
+        type_label = (u"Missing Architecture Element" if issue_type == u"missing_architecture"
+                       else u"Footprint Mismatch" if issue_type == u"footprint_mismatch"
+                       else issue_type or u"")
+        rows.append([
+            issue.get(u"title") or u"2D Mismatch",
+            u"Open",
+            u"Clash",
+            type_label,
+            issue.get(u"description") or u"",
+            u"",
+            issue.get(u"sheet_number") or issue.get(u"view_name") or u"",
+            _mismatch_location_details(issue),
+            u"", u"", u"", u"",
+        ])
+
+    lines = [u",".join(_csv_field(v) for v in row) for row in rows]
+    content = u"\r\n".join(lines) + u"\r\n"
+
+    f = open(save_path, "wb")
+    try:
+        f.write("\xef\xbb\xbf")
+        f.write(content.encode(u"utf-8"))
+    finally:
+        f.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW FILTERS  (Step 8C/8D)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4780,21 +4848,48 @@ def run():
         title = u"EasyBIM — Coordination Graphics — Done, with warnings"
     TaskDialog.Show(title, body)
 
-    # ── 2D mismatch export (BCF 2.1) ────────────────────────────────────────
+    # ── 2D mismatch export (BCF 2.1 or CSV, user's choice via command link) ─
     if all_mismatches:
-        save_path = forms.save_file(file_ext=u"bcfzip", default_name=u"coordination_mismatches.bcfzip")
-        if save_path:
-            try:
-                export_mismatches_to_bcf(all_mismatches, save_path)
-                TaskDialog.Show(
-                    u"EasyBIM — Coordination Graphics — BCF Export",
-                    u"{} 2D mismatch(es) found across {} view(s) — exported to:\n{}".format(
-                        len(all_mismatches), len(view_results), save_path))
-            except Exception:
-                TaskDialog.Show(
-                    u"EasyBIM — Coordination Graphics — BCF Export Failed",
-                    u"{} mismatch(es) were found, but the BCF export failed:\n\n{}".format(
-                        len(all_mismatches), traceback.format_exc()))
+        export_td = TaskDialog(u"EasyBIM — Coordination Graphics — Mismatches Found")
+        export_td.MainInstruction = u"{} 2D mismatch(es) found across {} view(s).".format(
+            len(all_mismatches), len(view_results))
+        export_td.MainContent = u"Export them to a file, or close this without exporting."
+        export_td.AddCommandLink(
+            TaskDialogCommandLinkId.CommandLink1, u"Export to BCF 2.1 (.bcfzip)",
+            u"For import into a BCF-compatible viewer (e.g. ACC/BIM 360, Solibri).")
+        export_td.AddCommandLink(
+            TaskDialogCommandLinkId.CommandLink2, u"Export to CSV (ACC Issues format)",
+            u"Same column layout as ACC's own bulk Issues import template.")
+        export_td.CommonButtons = TaskDialogCommonButtons.Close
+        export_td.DefaultButton = TaskDialogResult.Close
+        export_choice = export_td.Show()
+
+        if export_choice == TaskDialogResult.CommandLink1:
+            save_path = forms.save_file(file_ext=u"bcfzip", default_name=u"coordination_mismatches.bcfzip")
+            if save_path:
+                try:
+                    export_mismatches_to_bcf(all_mismatches, save_path)
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — BCF Export",
+                        u"Exported {} mismatch(es) to:\n{}".format(len(all_mismatches), save_path))
+                except Exception:
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — BCF Export Failed",
+                        u"{} mismatch(es) were found, but the BCF export failed:\n\n{}".format(
+                            len(all_mismatches), traceback.format_exc()))
+        elif export_choice == TaskDialogResult.CommandLink2:
+            save_path = forms.save_file(file_ext=u"csv", default_name=u"coordination_mismatches.csv")
+            if save_path:
+                try:
+                    export_mismatches_to_csv(all_mismatches, save_path)
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — CSV Export",
+                        u"Exported {} mismatch(es) to:\n{}".format(len(all_mismatches), save_path))
+                except Exception:
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — CSV Export Failed",
+                        u"{} mismatch(es) were found, but the CSV export failed:\n\n{}".format(
+                            len(all_mismatches), traceback.format_exc()))
 
 
 def main():
