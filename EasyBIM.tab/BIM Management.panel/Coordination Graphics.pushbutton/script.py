@@ -4144,7 +4144,17 @@ def run():
         # takes an Element, not a category, so it doesn't fit this
         # "before any element exists" use case) — and only keeping
         # categories that pass.
-        manual_hide_names = set(settings.get(u"ManualHideTypeNames") or [])
+        # Each entry can itself be a comma-separated list (e.g. "Type A, Type
+        # B") if the user typed/pasted multiple names into one line instead
+        # of adding them one at a time via "Add from Model..." — split and
+        # strip every entry so those aren't treated as one unmatchable
+        # literal name.
+        manual_hide_names = set()
+        for raw_name in (settings.get(u"ManualHideTypeNames") or []):
+            for token in (raw_name or u"").split(u","):
+                token = token.strip()
+                if token:
+                    manual_hide_names.add(token)
         try:
             filterable_cat_ids = list(DB.ParameterFilterUtilities.GetAllFilterableCategories())
         except Exception as ex:
