@@ -1,0 +1,4 @@
+title: Syncguard
+tooltip: Sync the open model with central and relinquish all ownership. Reports warnings, timing and leftover workset ownership.
+author: EasyBIM Team
+min_revit_ver: 2023
