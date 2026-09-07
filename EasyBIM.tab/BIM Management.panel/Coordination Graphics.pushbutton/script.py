@@ -221,9 +221,13 @@ __author__ = "EasyBIM"
 __doc__ = "Color-code concrete Walls/Columns/Framing/Foundations in the Architecture and Structure links via View Filters."
 
 import clr
+import datetime
 import math
 import re
 import traceback
+import uuid
+import xml.etree.ElementTree as ET
+import zipfile
 
 clr.AddReference('RevitAPI')
 clr.AddReference('RevitAPIUI')
@@ -235,7 +239,8 @@ clr.AddReference('System')
 
 from Autodesk.Revit import DB
 from Autodesk.Revit.DB import Structure
-from Autodesk.Revit.UI import TaskDialog
+from Autodesk.Revit.UI import (
+    TaskDialog, TaskDialogCommandLinkId, TaskDialogCommonButtons, TaskDialogResult)
 
 import System
 import System.Collections.Generic as SCG
@@ -246,7 +251,7 @@ from System.Windows.Markup import XamlReader
 from System.IO import StringReader
 from System.Xml import XmlReader as SysXmlReader
 
-from pyrevit import revit, script
+from pyrevit import forms, revit, script
 from easybim import coordination_settings as cfgmod
 from easybim import coordination_settings_ui as settings_ui
 from easybim import ui as ebui
@@ -3017,6 +3022,332 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2D MISMATCH DETECTION + BCF EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+MISMATCH_2D_TOLERANCE_FT = 0.5
+# ~150mm default — a Structure/Architecture concrete footprint pair within
+# this in every direction is treated as "the same element coordinated
+# correctly"; anything wider is flagged. Passed as detect_2d_mismatches'
+# tolerance_ft, not hardcoded there, so a future Settings.json key can
+# override it without touching this function.
+
+
+def get_concrete_elements(link_doc, categories, cfg):
+    """Same classification signals as _collect_concrete_type_names (type-
+    level _type_is_concrete, including its manual include/exclude and
+    Material Class checks, plus the per-instance _instance_material_texts
+    override) so mismatch detection only ever flags/matches elements that
+    would ALSO get colored by the visual hatch -- a "mismatch" that isn't
+    even classified as concrete would be meaningless noise. Returns actual
+    Element objects (not just Type Names, unlike _collect_concrete_type_
+    names) since detect_2d_mismatches needs each instance's own geometry.
+    Deliberately NOT calling _collect_concrete_type_names itself and
+    reshaping its result -- that function is load-bearing, live-tested
+    production logic (see its own docstring's bug-fix history) collecting
+    names into a set; duplicating its per-element loop here instead of
+    changing its signature/return shape keeps that function's proven
+    behavior completely untouched. No nested-link recursion (unlike
+    _collect_concrete_type_names) -- kept simple for this first version;
+    add it the same way (one level, capped) if nested-link content turns
+    out to need mismatch checking too."""
+    elements = []
+    if link_doc is None:
+        return elements
+
+    type_cache = {}  # type_id (int) -> is_concrete
+    concrete_kw = cfg.get(u"ConcreteKeywords") or []
+    exclude_kw  = cfg.get(u"ExcludeKeywords") or []
+
+    for bic in categories:
+        try:
+            elems = (DB.FilteredElementCollector(link_doc)
+                       .OfCategory(bic)
+                       .WhereElementIsNotElementType()
+                       .ToElements())
+        except Exception:
+            continue
+        is_wall = (bic == DB.BuiltInCategory.OST_Walls)
+
+        for elem in elems:
+            try:
+                type_id = elem.GetTypeId()
+            except Exception:
+                continue
+            if type_id is None or type_id == DB.ElementId.InvalidElementId:
+                continue
+
+            key = type_id.IntegerValue
+            if key not in type_cache:
+                elem_type = link_doc.GetElement(type_id)
+                is_conc = False
+                if elem_type is not None:
+                    try:
+                        is_conc = _type_is_concrete(link_doc, elem_type, bic, cfg)
+                    except Exception:
+                        is_conc = False
+                type_cache[key] = is_conc
+            is_conc = type_cache[key]
+
+            if not is_conc and not is_wall:
+                try:
+                    inst_texts = _instance_material_texts(link_doc, elem)
+                    if inst_texts:
+                        combined = u" | ".join(inst_texts)
+                        if (_contains_any(combined, concrete_kw)
+                                and not _contains_any(combined, exclude_kw)):
+                            is_conc = True
+                except Exception:
+                    pass
+
+            if is_conc:
+                elements.append(elem)
+
+    return elements
+
+
+def _transformed_2d_bbox(elem, transform):
+    """(min_x, min_y, max_x, max_y) of elem's BoundingBox in HOST document
+    coordinates, or None if it has none. Transforms all 8 corners (not just
+    Min/Max) before taking the axis-aligned min/max -- a link rotated
+    relative to the host would otherwise give a wrong, un-rotated box if
+    only the two corner points were transformed directly."""
+    try:
+        bbox = elem.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+    if bbox is None:
+        return None
+    mn, mx = bbox.Min, bbox.Max
+    corners = [
+        DB.XYZ(mn.X, mn.Y, mn.Z), DB.XYZ(mx.X, mn.Y, mn.Z),
+        DB.XYZ(mn.X, mx.Y, mn.Z), DB.XYZ(mx.X, mx.Y, mn.Z),
+        DB.XYZ(mn.X, mn.Y, mx.Z), DB.XYZ(mx.X, mn.Y, mx.Z),
+        DB.XYZ(mn.X, mx.Y, mx.Z), DB.XYZ(mx.X, mx.Y, mx.Z),
+    ]
+    try:
+        pts = [transform.OfPoint(c) for c in corners]
+    except Exception:
+        return None
+    xs = [p.X for p in pts]
+    ys = [p.Y for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def detect_2d_mismatches(doc, arch_link, struct_link, tolerance_ft, override_bics, settings):
+    """For every concrete Structure element (get_concrete_elements on
+    struct_link), find the best-overlapping concrete Architecture element
+    (get_concrete_elements on arch_link) within tolerance_ft of each other
+    in plan (host-coordinate 2D footprint, via _transformed_2d_bbox) and
+    flag an issue dict if either (a) no Architecture element overlaps it
+    at all within tolerance, or (b) one does, but its footprint still
+    differs from Structure's by more than tolerance_ft in some direction
+    (e.g. same column grid position, different size/edge). "Best" match
+    = largest 2D overlap area, so a nearby-but-unrelated element doesn't
+    win over the one actually coordinating with this Structure element.
+    Only Structure elements are walked (not the reverse) -- an
+    Architecture element with no Structure counterpart at all (e.g. a
+    partition wall) isn't a structural coordination issue."""
+    issues = []
+    arch_doc    = arch_link.get(u"doc")
+    struct_doc  = struct_link.get(u"doc")
+    arch_inst   = arch_link.get(u"instance")
+    struct_inst = struct_link.get(u"instance")
+    if arch_doc is None or struct_doc is None or arch_inst is None or struct_inst is None:
+        return issues
+
+    try:
+        arch_transform = arch_inst.GetTotalTransform()
+        struct_transform = struct_inst.GetTotalTransform()
+    except Exception:
+        return issues
+
+    arch_boxes = []
+    for elem in get_concrete_elements(arch_doc, override_bics, settings):
+        box = _transformed_2d_bbox(elem, arch_transform)
+        if box is not None:
+            arch_boxes.append((elem, box))
+
+    for struct_elem in get_concrete_elements(struct_doc, override_bics, settings):
+        struct_box = _transformed_2d_bbox(struct_elem, struct_transform)
+        if struct_box is None:
+            continue
+        smin_x, smin_y, smax_x, smax_y = struct_box
+
+        best_arch, best_box, best_area = None, None, -1.0
+        for arch_elem, arch_box in arch_boxes:
+            amin_x, amin_y, amax_x, amax_y = arch_box
+            if (amax_x + tolerance_ft < smin_x or smax_x + tolerance_ft < amin_x or
+                    amax_y + tolerance_ft < smin_y or smax_y + tolerance_ft < amin_y):
+                continue  # not even within tolerance of overlapping — not a candidate at all
+            ox = min(amax_x, smax_x) - max(amin_x, smin_x)
+            oy = min(amax_y, smax_y) - max(amin_y, smin_y)
+            area = max(ox, 0.0) * max(oy, 0.0)
+            if area > best_area:
+                best_arch, best_box, best_area = arch_elem, arch_box, area
+
+        center = ((smin_x + smax_x) / 2.0, (smin_y + smax_y) / 2.0)
+
+        if best_arch is None:
+            issues.append({
+                u"type": u"missing_architecture",
+                u"struct_elem": struct_elem, u"arch_elem": None,
+                u"struct_box": struct_box, u"arch_box": None, u"center": center,
+                u"title": u"Structure element with no matching Architecture element",
+                u"description": (
+                    u"Structure element Id {} (Category: {}) has no concrete Architecture "
+                    u"element within {:.2f} ft of it.".format(
+                        struct_elem.Id.IntegerValue,
+                        _elem_name(struct_elem.Category) if struct_elem.Category else u"?",
+                        tolerance_ft)),
+            })
+            continue
+
+        amin_x, amin_y, amax_x, amax_y = best_box
+        delta = max(abs(smin_x - amin_x), abs(smin_y - amin_y),
+                    abs(smax_x - amax_x), abs(smax_y - amax_y))
+        if delta > tolerance_ft:
+            issues.append({
+                u"type": u"footprint_mismatch",
+                u"struct_elem": struct_elem, u"arch_elem": best_arch,
+                u"struct_box": struct_box, u"arch_box": best_box, u"center": center,
+                u"title": u"Structure/Architecture footprint mismatch",
+                u"description": (
+                    u"Structure element Id {} and Architecture element Id {} overlap, but "
+                    u"their 2D footprints differ by {:.2f} ft in at least one direction "
+                    u"(tolerance {:.2f} ft).".format(
+                        struct_elem.Id.IntegerValue, best_arch.Id.IntegerValue,
+                        delta, tolerance_ft)),
+            })
+
+    return issues
+
+
+def export_mismatches_to_bcf(mismatches, save_path):
+    """Minimal, best-effort BCF 2.1 export — one Topic per mismatch, zipped
+    per the BCF 2.1 folder layout (bcf.version + one GUID folder per topic
+    holding markup.bcf + viewpoint.bcfv). NOT validated against the
+    official BCF 2.1 XSD or a real BCF reader/ACC import — in particular,
+    <SheetName> is NOT part of the standard BCF 2.1 schema at all; it's
+    included only because ACC/BIM 360 is reported to use it to place a 2D
+    pushpin on a specific sheet. Confirm a real import actually does that
+    before relying on this for anything more than a rough visual record."""
+    BCF_NS = u"http://www.buildingsmart-tech.org/specifications/BCF-XML"
+    now_iso = datetime.datetime.utcnow().strftime(u"%Y-%m-%dT%H:%M:%SZ")
+
+    zf = zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED)
+    try:
+        version_root = ET.Element(u"Version", {u"xmlns": BCF_NS, u"VersionId": u"2.1"})
+        zf.writestr(u"bcf.version", ET.tostring(version_root, encoding=u"utf-8"))
+
+        for issue in mismatches:
+            guid = str(uuid.uuid4())
+            view_name = issue.get(u"view_name")
+            sheet_number = issue.get(u"sheet_number")
+            sheet_or_view = sheet_number or view_name
+
+            markup = ET.Element(u"Markup", {u"xmlns": BCF_NS})
+            topic = ET.SubElement(markup, u"Topic", {
+                u"Guid": guid, u"TopicType": u"Clash", u"TopicStatus": u"Open"})
+            ET.SubElement(topic, u"Title").text = issue.get(u"title") or u"2D Mismatch"
+            ET.SubElement(topic, u"Description").text = issue.get(u"description") or u""
+            ET.SubElement(topic, u"CreationDate").text = now_iso
+            ET.SubElement(topic, u"CreationAuthor").text = u"EasyBIM Coordination Graphics"
+            if sheet_or_view:
+                ET.SubElement(topic, u"SheetName").text = sheet_or_view
+            zf.writestr(u"{}/markup.bcf".format(guid), ET.tostring(markup, encoding=u"utf-8"))
+
+            center = issue.get(u"center") or (0.0, 0.0)
+            viz = ET.Element(u"VisualizationInfo", {u"xmlns": BCF_NS, u"Guid": guid})
+            cam = ET.SubElement(viz, u"OrthogonalCamera")
+            view_point = ET.SubElement(cam, u"CameraViewPoint")
+            ET.SubElement(view_point, u"X").text = str(center[0])
+            ET.SubElement(view_point, u"Y").text = str(center[1])
+            ET.SubElement(view_point, u"Z").text = u"0"
+            direction = ET.SubElement(cam, u"CameraDirection")
+            ET.SubElement(direction, u"X").text = u"0"
+            ET.SubElement(direction, u"Y").text = u"0"
+            ET.SubElement(direction, u"Z").text = u"-1"
+            up_vec = ET.SubElement(cam, u"CameraUpVector")
+            ET.SubElement(up_vec, u"X").text = u"0"
+            ET.SubElement(up_vec, u"Y").text = u"1"
+            ET.SubElement(up_vec, u"Z").text = u"0"
+            ET.SubElement(cam, u"ViewToWorldScale").text = u"1"
+            if sheet_or_view:
+                ET.SubElement(viz, u"Document").text = sheet_or_view
+            zf.writestr(u"{}/viewpoint.bcfv".format(guid), ET.tostring(viz, encoding=u"utf-8"))
+    finally:
+        zf.close()
+
+
+ACC_ISSUES_CSV_HEADER = [
+    u"Title (Required)", u"Status", u"Category", u"Type", u"Description",
+    u"Assigned To", u"Location", u"Location details",
+    u"Due Date (YYYY-MM-DD format)", u"Start Date (YYYY-MM-DD format)",
+    u"Root Cause Category", u"Root Cause",
+]
+
+
+def _csv_field(value):
+    text = value if isinstance(value, basestring) else unicode(value)
+    text = text.replace(u'"', u'""')
+    if any(ch in text for ch in (u',', u'"', u'\n', u'\r')):
+        return u'"{}"'.format(text)
+    return text
+
+
+def _mismatch_location_details(issue):
+    parts = []
+    struct_elem = issue.get(u"struct_elem")
+    arch_elem = issue.get(u"arch_elem")
+    if struct_elem is not None:
+        parts.append(u"Structure Id {}".format(struct_elem.Id.IntegerValue))
+    if arch_elem is not None:
+        parts.append(u"Architecture Id {}".format(arch_elem.Id.IntegerValue))
+    return u", ".join(parts)
+
+
+def export_mismatches_to_csv(mismatches, save_path):
+    """Same 12-column layout as ACC's own bulk Issues import template (see
+    tools/acc_issues_export.py, built earlier for the same purpose as a
+    standalone script) -- CSV instead of a real .xlsx specifically for
+    this in-Revit button, since IronPython has no reliable, dependency-
+    free way to write genuine OOXML .xlsx, and requiring every team
+    member to separately install a matching CPython3 + openpyxl just to
+    click one button here isn't worth the fragility. Written with a UTF-8
+    BOM (every field may contain Hebrew, e.g. type/category names) so
+    Excel auto-detects the encoding correctly on a plain double-click
+    instead of showing mojibake."""
+    rows = [ACC_ISSUES_CSV_HEADER]
+    for issue in mismatches:
+        issue_type = issue.get(u"type")
+        type_label = (u"Missing Architecture Element" if issue_type == u"missing_architecture"
+                       else u"Footprint Mismatch" if issue_type == u"footprint_mismatch"
+                       else issue_type or u"")
+        rows.append([
+            issue.get(u"title") or u"2D Mismatch",
+            u"Open",
+            u"Clash",
+            type_label,
+            issue.get(u"description") or u"",
+            u"",
+            issue.get(u"sheet_number") or issue.get(u"view_name") or u"",
+            _mismatch_location_details(issue),
+            u"", u"", u"", u"",
+        ])
+
+    lines = [u",".join(_csv_field(v) for v in row) for row in rows]
+    content = u"\r\n".join(lines) + u"\r\n"
+
+    f = open(save_path, "wb")
+    try:
+        f.write("\xef\xbb\xbf")
+        f.write(content.encode(u"utf-8"))
+    finally:
+        f.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VIEW FILTERS  (Step 8C/8D)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3403,38 +3734,106 @@ def are_pattern_angles_colliding(doc, id1, id2):
     return abs(angle1 - angle2) < 0.01
 
 
-def get_rotated_pattern_id(doc, original_id, angle_degrees=45.0):
+def get_rotated_pattern_id(doc, original_id, angle_degrees=90.0):
     """Auto-fix for are_pattern_angles_colliding: a colliding pattern isn't
     fixable from this tool's own Settings (it's Revit project data), so
     instead of just warning, create (or reuse) a rotated COPY of the
     pattern -- never rotate the original in place, since other elements
-    in the model may already legitimately rely on its current angle."""
+    in the model may already legitimately rely on its current angle.
+
+    angle_degrees defaults to 90, NOT 45: rotating any line by 90 degrees
+    always gives a perpendicular line, which can never coincide with the
+    original at any starting angle (found live: the first version of this
+    used 45, which for a pattern already at 45 degrees produces 90 --
+    i.e. a plain vertical line, not a diagonal at all, since 45+45=90).
+    A "mirror" transform (angle -> 180-angle) was considered instead --
+    it matches Revit's own "Diagonal down" (135) for a 45-degree "Diagonal
+    up" input -- but rejected because it has a real degenerate case: at
+    exactly 0 or 90 degrees, 180-angle lands back on the SAME angle
+    (0->180==0, 90->90), silently failing to resolve the collision it was
+    supposed to fix. +90 has no such blind spot for any input angle.
+
+    BUG FOUND LIVE: building a blank `DB.FillPattern()`, setting `.Name`
+    on it, then calling `.SetFillGrids(...)` and only THEN
+    `FillPatternElement.Create(doc, new_fp)` reliably threw "fillPattern
+    does not have a valid Name" from Create() itself -- something about
+    that order (most likely SetFillGrids on a still-unattached FillPattern
+    resetting/discarding whatever was assigned before it) leaves Name
+    unset by the time Create() validates it. Every real Structure/
+    Architecture diagonal pattern seen so far (Diagonal up/down 1.5mm) is
+    a single FillGrid with no dash Segments, which is exactly what
+    Revit's own `FillPattern(name, target, hostOrientation, angle,
+    spacing)` constructor is for -- name is part of construction, not a
+    property set afterward, so there's no ordering pitfall to hit at all.
+    Used for that common case; the manual FillGrid-rebuilding path (still
+    needed for a multi-grid pattern, e.g. a cross-hatch, or one with dash
+    Segments, neither of which that simpler constructor can express) is
+    kept as a fallback, with Name set LAST as a defensive measure against
+    the same suspected ordering issue -- unverified live, since no
+    multi-grid Structure/Architecture pattern has been seen in practice.
+
+    A prior run with the buggy 45-degree default may already have created
+    (and this function would otherwise keep reusing, by name alone) a
+    "*_Rotated45" pattern that's rotated by the WRONG amount -- so an
+    existing same-named pattern's actual angle(s) are compared against
+    what rotating original_id's CURRENT angle by angle_degrees would
+    produce, not against whether it merely "collides with original_id"
+    (found live: it always doesn't, for any nonzero angle_degrees,
+    regardless of whether that rotation amount was ever the intended
+    one -- comparing against original_id instead of the actual target
+    angle let a stale wrong-angle copy get silently reused forever,
+    since it also happened to differ from original_id, just not by the
+    amount actually needed). Rebuilt via SetFillPattern (proven live, see
+    build_colored_override's sibling fix this same day) if it doesn't
+    match; only trusted as-is if its angle(s) already do."""
     original_fpe = doc.GetElement(original_id)
+    original_fp = original_fpe.GetFillPattern()
     original_name = _elem_name(original_fpe)
     rotated_name = original_name + u"_Rotated45"
+    angle_offset = math.radians(angle_degrees)
+    grids = list(original_fp.GetFillGrids())
+    target_angles = tuple(sorted(
+        int(round((g.Angle + angle_offset) * 180.0 / math.pi)) % 180 for g in grids))
 
+    existing_fpe = None
     for fpe in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement):
         if _elem_name(fpe) == rotated_name:
-            return fpe.Id
+            existing_fpe = fpe
+            break
 
-    original_fp = original_fpe.GetFillPattern()
-    new_fp = DB.FillPattern()
-    new_fp.Name = rotated_name
-    new_fp.Target = original_fp.Target
-    new_fp.HostOrientation = original_fp.HostOrientation
+    if existing_fpe is not None:
+        existing_angles = tuple(sorted(
+            int(round(eg.Angle * 180.0 / math.pi)) % 180
+            for eg in existing_fpe.GetFillPattern().GetFillGrids()))
+        if existing_angles == target_angles:
+            return existing_fpe.Id
 
-    new_grids = []
-    for g in original_fp.GetFillGrids():
-        ng = DB.FillGrid()
-        ng.Origin = g.Origin
-        ng.Angle = g.Angle + math.radians(angle_degrees)
-        ng.Offset = g.Offset
-        ng.Shift = g.Shift
-        segs = list(g.GetSegments())
-        if segs:
-            ng.SetSegments(segs)
-        new_grids.append(ng)
-    new_fp.SetFillGrids(new_grids)
+    if len(grids) == 1 and not list(grids[0].GetSegments()):
+        g = grids[0]
+        new_fp = DB.FillPattern(
+            rotated_name, original_fp.Target, original_fp.HostOrientation,
+            g.Angle + angle_offset, g.Offset)
+    else:
+        new_fp = DB.FillPattern()
+        new_fp.Target = original_fp.Target
+        new_fp.HostOrientation = original_fp.HostOrientation
+        new_grids = []
+        for g in grids:
+            ng = DB.FillGrid()
+            ng.Origin = g.Origin
+            ng.Angle = g.Angle + angle_offset
+            ng.Offset = g.Offset
+            ng.Shift = g.Shift
+            segs = list(g.GetSegments())
+            if segs:
+                ng.SetSegments(segs)
+            new_grids.append(ng)
+        new_fp.SetFillGrids(new_grids)
+        new_fp.Name = rotated_name
+
+    if existing_fpe is not None:
+        existing_fpe.SetFillPattern(new_fp)
+        return existing_fpe.Id
 
     new_fpe = DB.FillPatternElement.Create(doc, new_fp)
     return new_fpe.Id
@@ -4047,7 +4446,7 @@ def run():
         if are_pattern_angles_colliding(doc, struct_fill_id, arch_fill_id):
             global_warnings.append(
                 u"Structure's and Architecture's hatch patterns draw at the same angle — "
-                u"auto-fixed by rotating a copy of Structure's pattern 45 degrees (created/"
+                u"auto-fixed by rotating a copy of Structure's pattern 90 degrees (created/"
                 u"reused '{}_Rotated45').".format(_elem_name(doc.GetElement(struct_fill_id))))
             struct_fill_id = get_rotated_pattern_id(doc, struct_fill_id)
 
@@ -4205,6 +4604,7 @@ def run():
     # case, just re-run that one view" tolerance this batch mode was built
     # around, instead of one giant all-or-nothing transaction.
     view_results = []
+    all_mismatches = []
     for view in selected_views:
         vr = {
             u"name": _elem_name(view), u"warnings": [], u"sheet": None,
@@ -4328,6 +4728,25 @@ def run():
                 if view_for_sheet is not None:
                     vr[u"sheet"] = _create_and_place_sheet(
                         view_for_sheet, _elem_name(view_for_sheet), titleblock_symbol, w)
+
+            # ── Refinement 3: 2D mismatch detection (Structure vs Architecture) ─
+            # Runs per view (not hoisted into the shared t0 setup like the
+            # deep-scan above) specifically so each mismatch can be tagged with
+            # THIS view's name/sheet for BCF export below — read-only (no
+            # document edits), so it needs no transaction of its own and any
+            # exception here is caught by this view's own except block below,
+            # same as everything else in this try. Every Architecture/
+            # Structure link COMBINATION selected for this batch is checked,
+            # not just the first of each.
+            sheet_number = vr[u"sheet"].SheetNumber if vr[u"sheet"] is not None else None
+            for arch_li in arch_links:
+                for struct_li in struct_links:
+                    view_issues = detect_2d_mismatches(
+                        doc, arch_li, struct_li, MISMATCH_2D_TOLERANCE_FT, override_bics, settings)
+                    for issue in view_issues:
+                        issue[u"view_name"] = vr[u"name"]
+                        issue[u"sheet_number"] = sheet_number
+                    all_mismatches.extend(view_issues)
 
             # ── Step 5: hide every other link (e.g. MEP) ────────────────────────
             # Runs LAST, after the template/filter work above — see the
@@ -4496,6 +4915,49 @@ def run():
     elif total_warnings:
         title = u"EasyBIM — Coordination Graphics — Done, with warnings"
     TaskDialog.Show(title, body)
+
+    # ── 2D mismatch export (BCF 2.1 or CSV, user's choice via command link) ─
+    if all_mismatches:
+        export_td = TaskDialog(u"EasyBIM — Coordination Graphics — Mismatches Found")
+        export_td.MainInstruction = u"{} 2D mismatch(es) found across {} view(s).".format(
+            len(all_mismatches), len(view_results))
+        export_td.MainContent = u"Export them to a file, or close this without exporting."
+        export_td.AddCommandLink(
+            TaskDialogCommandLinkId.CommandLink1, u"Export to BCF 2.1 (.bcfzip)",
+            u"For import into a BCF-compatible viewer (e.g. ACC/BIM 360, Solibri).")
+        export_td.AddCommandLink(
+            TaskDialogCommandLinkId.CommandLink2, u"Export to CSV (ACC Issues format)",
+            u"Same column layout as ACC's own bulk Issues import template.")
+        export_td.CommonButtons = TaskDialogCommonButtons.Close
+        export_td.DefaultButton = TaskDialogResult.Close
+        export_choice = export_td.Show()
+
+        if export_choice == TaskDialogResult.CommandLink1:
+            save_path = forms.save_file(file_ext=u"bcfzip", default_name=u"coordination_mismatches.bcfzip")
+            if save_path:
+                try:
+                    export_mismatches_to_bcf(all_mismatches, save_path)
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — BCF Export",
+                        u"Exported {} mismatch(es) to:\n{}".format(len(all_mismatches), save_path))
+                except Exception:
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — BCF Export Failed",
+                        u"{} mismatch(es) were found, but the BCF export failed:\n\n{}".format(
+                            len(all_mismatches), traceback.format_exc()))
+        elif export_choice == TaskDialogResult.CommandLink2:
+            save_path = forms.save_file(file_ext=u"csv", default_name=u"coordination_mismatches.csv")
+            if save_path:
+                try:
+                    export_mismatches_to_csv(all_mismatches, save_path)
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — CSV Export",
+                        u"Exported {} mismatch(es) to:\n{}".format(len(all_mismatches), save_path))
+                except Exception:
+                    TaskDialog.Show(
+                        u"EasyBIM — Coordination Graphics — CSV Export Failed",
+                        u"{} mismatch(es) were found, but the CSV export failed:\n\n{}".format(
+                            len(all_mismatches), traceback.format_exc()))
 
 
 def main():
