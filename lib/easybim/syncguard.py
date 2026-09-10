@@ -135,6 +135,8 @@ class Recorder(object):
     def declare_step(self, key, status=STEP_PENDING, message=u""):
         """Register a step up front so one that never ran is still reported."""
         self._steps.append({u"key": key, u"status": status, u"message": message})
+        self._emit(u"step", {u"key": key, u"status": status,
+                             u"message": message})
 
     def set_step(self, key, status, message=None):
         for step in self._steps:
@@ -142,9 +144,13 @@ class Recorder(object):
                 step[u"status"] = status
                 if message is not None:
                     step[u"message"] = message
+                self._emit(u"step", {u"key": key, u"status": status,
+                                     u"message": step[u"message"]})
                 return
         self._steps.append(
             {u"key": key, u"status": status, u"message": message or u""})
+        self._emit(u"step", {u"key": key, u"status": status,
+                             u"message": message or u""})
 
     def steps(self):
         return [dict(step) for step in self._steps]
@@ -166,7 +172,7 @@ class Recorder(object):
             self.lines.append(entry)
         else:
             self.lines_truncated = True
-        self._emit(entry)
+        self._emit(u"line", entry)
         if self._echo:
             try:
                 self._echo(entry[u"level"], entry[u"text"])
@@ -188,8 +194,24 @@ class Recorder(object):
     def error_count(self):
         return len([e for e in self.lines if e[u"level"] == u"error"])
 
-    def _emit(self, entry):
+    def _emit(self, kind, payload):
         """Append one NDJSON record, flushed.
+
+        Two kinds, matching the seam documented in SYNCGUARD_PLAN.md so the tray
+        agent forwards rather than translates:
+
+            {"t": ..., "kind": "line", "level": ..., "text": ...}
+            {"t": ..., "kind": "step", "key": ..., "status": ..., "message": ...}
+
+        Step events matter beyond tidiness: the agent's timeout has to be
+        phase-aware, because the model open blocks for many minutes and emits
+        nothing while it works. The open-model running/done transitions are the
+        only signal that lets the agent tell a slow open from a hang.
+
+        Opened and closed per record rather than holding a handle: events are
+        rare, it avoids a Windows locking fight with the tailing agent, and
+        everything up to the last event survives a taskkill -- so a timeout can
+        report *where* the run hung.
 
         Best-effort by design -- progress reporting must never be the reason a
         sync fails.
@@ -200,8 +222,9 @@ class Recorder(object):
             folder = os.path.dirname(self._progress_path)
             if folder and not os.path.isdir(folder):
                 os.makedirs(folder)
-            record = dict(entry)
-            record[u"at"] = _utc_now()
+            record = dict(payload)
+            record[u"kind"] = kind
+            record[u"t"] = _utc_now()
             with codecs.open(self._progress_path, u"a", u"utf-8") as handle:
                 handle.write(json.dumps(
                     record, ensure_ascii=False, sort_keys=True) + u"\n")
