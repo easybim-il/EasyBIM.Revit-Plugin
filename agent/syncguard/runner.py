@@ -424,18 +424,23 @@ class SyncRunner(object):
                                   "text": "Revit was showing: %s" % text})
 
             # Silence during startup with nothing written at all means Revit
-            # never reached the script. That is a machine-state problem, not a
-            # transient one — most often another Revit already holding the
-            # single-user licence — so a retry fails identically.
+            # never reached the script. When Revit left a dialog behind, that
+            # dialog IS the diagnosis and a human should see it verbatim —
+            # these have been licence-checkout and COM-busy faults, which need
+            # the machine seen to rather than a blind retry.
             if self.phase == "startup" and progress_bytes == 0:
-                detail = (" Revit said: %s" % self.blocking_dialogs[0]) \
-                    if self.blocking_dialogs else ""
+                if self.blocking_dialogs:
+                    return Outcome(
+                        "needs_attention",
+                        "Revit could not start properly on this computer and "
+                        "never ran the sync. It reported: “%s”"
+                        % self.blocking_dialogs[0],
+                        lines, diagnostics)
                 return Outcome(
                     "needs_attention",
                     "Revit started but never ran the Syncguard script on this "
-                    "computer. Close any other Revit window there and try "
-                    "again — a second Revit cannot get a licence while one is "
-                    "already open.%s" % detail,
+                    "computer, and left no explanation. Check pyRevit and the "
+                    "EasyBIM extension on that machine.",
                     lines, diagnostics)
             return Outcome("failed", None, lines, diagnostics)
 
