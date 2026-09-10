@@ -144,15 +144,25 @@ def _kill_tree(pid):
         pass
 
 
-def _kill_pids(pids):
+def _kill_revit(pids, log):
+    """Kill Revit processes this run started, and report what blocked them.
+
+    `taskkill /F` alone is not sufficient — see machine.force_kill. Any dialog
+    text recovered on the way out is the most useful diagnostic there is for a
+    run that produced no output.
+    """
+    messages = []
     for pid in pids:
         try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           creationflags=_CREATE_NO_WINDOW,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=60)
-        except Exception:
-            pass
+            gone, dialog_text = machine.force_kill(pid)
+            messages.extend(dialog_text)
+            log("killed Revit %s (gone=%s)%s"
+                % (pid, gone,
+                   (" blocked on: %s" % "; ".join(dialog_text))
+                   if dialog_text else ""))
+        except Exception as exc:
+            log("could not kill Revit %s: %r" % (pid, exc))
+    return messages
 
 
 def _read_result(path):
@@ -181,6 +191,7 @@ class SyncRunner(object):
         self._log = logger or (lambda *_a, **_k: None)
         self.phase = "startup"
         self._phase_started = time.time()
+        self.blocking_dialogs = []
 
     def _set_phase(self, phase):
         if phase != self.phase:
@@ -309,7 +320,8 @@ class SyncRunner(object):
                 if new_revit:
                     self._log("killing Revit started by this run: %s"
                               % sorted(new_revit))
-                    _kill_pids(new_revit)
+                    self.blocking_dialogs = _kill_revit(sorted(new_revit),
+                                                        self._log)
                 try:
                     process.wait(timeout=30)
                 except Exception:
@@ -401,12 +413,31 @@ class SyncRunner(object):
                 "startup": "while starting Revit",
             }.get(self.phase, "during the run")
             minutes = int(self._silence_window() / 60)
-            return Outcome(
-                "failed", None,
-                [{"level": "error",
-                  "text": "No progress for %d minutes %s — Revit stopped "
-                          "responding and was closed." % (minutes, where)}],
-                diagnostics)
+            lines = [{"level": "error",
+                      "text": "No progress for %d minutes %s — Revit stopped "
+                              "responding and was closed."
+                              % (minutes, where)}]
+            if self.blocking_dialogs:
+                diagnostics["blockingDialogs"] = list(self.blocking_dialogs)
+                for text in self.blocking_dialogs:
+                    lines.append({"level": "error",
+                                  "text": "Revit was showing: %s" % text})
+
+            # Silence during startup with nothing written at all means Revit
+            # never reached the script. That is a machine-state problem, not a
+            # transient one — most often another Revit already holding the
+            # single-user licence — so a retry fails identically.
+            if self.phase == "startup" and progress_bytes == 0:
+                detail = (" Revit said: %s" % self.blocking_dialogs[0]) \
+                    if self.blocking_dialogs else ""
+                return Outcome(
+                    "needs_attention",
+                    "Revit started but never ran the Syncguard script on this "
+                    "computer. Close any other Revit window there and try "
+                    "again — a second Revit cannot get a licence while one is "
+                    "already open.%s" % detail,
+                    lines, diagnostics)
+            return Outcome("failed", None, lines, diagnostics)
 
         if progress_bytes > 0:
             # The script ran and reported, then died before writing a verdict.

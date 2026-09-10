@@ -162,6 +162,124 @@ def revit_running():
 
 
 # ---------------------------------------------------------------------------
+# Killing a stuck Revit
+# ---------------------------------------------------------------------------
+#
+# `taskkill /F` IS NOT ENOUGH, measured. A Revit blocked on a pre-journal modal
+# dialog survives it: taskkill returns "This operation returned because the
+# timeout period expired" and the process stays. The case that produced this was
+# a second Revit dying on
+#
+#     "The License Manager is not functioning or is improperly installed.
+#      Revit will shut down now."
+#
+# because another Revit already held the single-user licence. The dialog says
+# Revit will shut down, and it does — as soon as somebody presses OK. So the
+# working sequence is: press the buttons, then terminate if it is still there.
+
+_EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
+                                      wintypes.LPARAM)
+
+DIALOG_CLASS = "#32770"
+BM_CLICK = 0x00F5
+WM_CLOSE = 0x0010
+PROCESS_TERMINATE = 0x0001
+SYNCHRONIZE = 0x00100000
+
+
+def _window_text(hwnd):
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value
+
+
+def _class_name(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def visible_dialogs(pid):
+    """Visible standard-dialog windows belonging to `pid`, with their text."""
+    user32 = ctypes.windll.user32
+    found = []
+
+    def visit(hwnd, _lparam):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd) \
+                and _class_name(hwnd) == DIALOG_CLASS:
+            texts = []
+
+            def child(child_hwnd, _lp):
+                if _class_name(child_hwnd) == "Static":
+                    text = _window_text(child_hwnd).strip()
+                    if text:
+                        texts.append(text)
+                return True
+
+            user32.EnumChildWindows(hwnd, _EnumWindowsProc(child), 0)
+            found.append((hwnd, " ".join(texts)))
+        return True
+
+    try:
+        user32.EnumWindows(_EnumWindowsProc(visit), 0)
+    except Exception:
+        return []
+    return found
+
+
+def dismiss_dialogs(pid):
+    """Press the buttons on any modal dialog `pid` is stuck on.
+
+    Returns the dialog messages found, which are worth logging: they are
+    usually the real explanation for a run that produced nothing.
+    """
+    user32 = ctypes.windll.user32
+    messages = []
+    for hwnd, text in visible_dialogs(pid):
+        if text:
+            messages.append(text)
+        buttons = []
+
+        def child(child_hwnd, _lp):
+            if _class_name(child_hwnd) == "Button":
+                buttons.append(child_hwnd)
+            return True
+
+        try:
+            user32.EnumChildWindows(hwnd, _EnumWindowsProc(child), 0)
+            for button in buttons:
+                user32.SendMessageW(button, BM_CLICK, 0, 0)
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+    return messages
+
+
+def force_kill(pid, wait_sec=8):
+    """Make `pid` go away, and say what was blocking it.
+
+    Returns (gone, messages). Order matters: dismissing the dialog lets Revit
+    shut itself down, which is cleaner than terminating it mid-write.
+    """
+    kernel32 = ctypes.windll.kernel32
+    messages = dismiss_dialogs(pid)
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, pid)
+    if not handle:
+        return True, messages
+    try:
+        if kernel32.WaitForSingleObject(handle, int(wait_sec * 1000)) == 0:
+            return True, messages
+        kernel32.TerminateProcess(handle, 1)
+        return kernel32.WaitForSingleObject(handle, 5000) == 0, messages
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+# ---------------------------------------------------------------------------
 # Installed versions
 # ---------------------------------------------------------------------------
 

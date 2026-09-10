@@ -147,11 +147,30 @@ Syncguard Agent"`. Then read `agent.log`.
 after 5 minutes without a heartbeat. Check the agent is running and can reach the
 base URL in `config.json`.
 
-**"Revit is open with … — close it first".** The agent reports which cloud models
-the live Revit session has opened, and a run is refused rather than colliding
-over workset ownership. Close that model. Note this over-reports slightly: a
-model loaded only as a *link*, or opened and then closed during the session,
-still counts. Refusing wrongly costs a click; colliding costs a tangled model.
+**"Revit is open … close it first".** Close Revit on that machine entirely — not
+just the model.
+
+This is stricter than it first looks, and it is measured rather than cautious.
+Syncguard starts *its own* Revit. A second Revit on the same machine cannot get a
+licence while one is already open: it dies immediately with
+
+> The License Manager is not functioning or is improperly installed. Revit will
+> shut down now.
+
+and then sits on that dialog. The dialog is raised before journal playback
+begins, so pyRevit cannot auto-dismiss it, and the run produces no output at all
+until the silence timeout fires. So the agent refuses up front whenever any Revit
+is running, and reports *needs attention* — a retry cannot help while Revit is
+open.
+
+`taskkill /F` does **not** clear a Revit stuck like that; it returns "the
+operation returned because the timeout period expired" and the process stays.
+The agent presses the dialog's buttons first — the dialog means it, and Revit
+shuts down once acknowledged — and only then terminates the process.
+
+The agent also reports which cloud models the live session has opened, so the
+message can name one. That list over-reports slightly: a model loaded only as a
+*link*, or opened and then closed during the session, still counts.
 
 **Amber icon, "Autodesk sign-in needed".** Open Revit on that machine, sign in to
 Autodesk, then click the icon → **Recheck Autodesk sign-in**. It also clears

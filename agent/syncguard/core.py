@@ -304,21 +304,35 @@ class AgentCore(object):
             forwarder.step("open-revit", "running", "Starting Revit %s"
                            % job.revit_version)
 
-            # Defensive re-check. The platform refuses at enqueue time, but a
-            # human can open the model in the seconds between enqueue and
-            # claim, and colliding costs a workset-ownership tangle.
-            collision = machine.model_is_open(job.model_name)
-            if collision:
-                forwarder.line("error",
-                               "Revit is already open with %s on %s"
-                               % (collision, self.machine_name))
+            # ANY running Revit blocks the run, not just one holding the target
+            # model. Measured: `pyrevit run` starts a second Revit, which dies
+            # on "The License Manager is not functioning or is improperly
+            # installed. Revit will shut down now." because the first instance
+            # already holds the single-user licence. It then sits on a modal
+            # dialog that is raised before journal playback, so pyRevit cannot
+            # suppress it, and the run produces no output whatsoever until the
+            # silence timeout fires ten minutes later.
+            #
+            # So this check is not the belt-and-braces re-check it started as —
+            # it is the difference between an instant, accurate refusal and ten
+            # wasted minutes ending in a misleading "stopped responding".
+            if machine.revit_running():
+                collision = machine.model_is_open(job.model_name)
+                if collision:
+                    detail = "Revit is open with %s" % collision
+                else:
+                    detail = "Revit is open"
+                forwarder.line("error", "%s on %s — a second Revit cannot get "
+                                        "a licence while one is already open"
+                               % (detail, self.machine_name))
                 forwarder.step("open-revit", "failed", "Revit already open")
                 forwarder.flush_now()
-                self._complete(job, "needs_attention",
-                               "Revit is open with %s on %s — close it there, "
-                               "then run again."
-                               % (job.model_name, self.machine_name),
-                               forwarder)
+                self._complete(
+                    job, "needs_attention",
+                    "%s on %s. Close Revit there, then run again — Syncguard "
+                    "starts its own Revit and cannot while another is open."
+                    % (detail, self.machine_name),
+                    forwarder)
                 return
 
             if not self._await_takeover(job, forwarder):
