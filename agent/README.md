@@ -147,30 +147,61 @@ Syncguard Agent"`. Then read `agent.log`.
 after 5 minutes without a heartbeat. Check the agent is running and can reach the
 base URL in `config.json`.
 
-**"Revit is open … close it first".** Close Revit on that machine entirely — not
-just the model.
+**"Revit is open with … close it first".** Close that model on that machine. The
+agent reports which cloud models the live Revit session has opened, and a run is
+refused rather than colliding over workset ownership. The list over-reports
+slightly: a model loaded only as a *link*, or opened and then closed during the
+session, still counts. Refusing wrongly costs a click; colliding costs a tangled
+model.
 
-This is stricter than it first looks, and it is measured rather than cautious.
-Syncguard starts *its own* Revit. A second Revit on the same machine cannot get a
-licence while one is already open: it dies immediately with
+**"Autodesk licensing on this computer did not respond in time".** The most
+common real-world failure so far, and nothing to do with Syncguard or the model.
+Revit gives `AdskLicensingAgent.exe` 30 seconds to answer a licence checkout. On
+a machine where the agent takes longer to start, Revit gives up and shuts down
+before it ever runs the script — measured here at 9 to 16 seconds too late,
+repeatedly. The agent reads the reason out of the licensing log and quotes it, so
+the run says what happened instead of "no output".
+
+It is worth knowing that this failure is *invisible* from the outside: no
+progress file, no result, and an exit code of 0, because Revit auto-dismisses its
+own "will shut down" dialog through the journal. Without the licensing-log lookup
+it looks exactly like a broken install.
+
+**"Revit could not start properly … It reported: …".** Revit never reached the
+script, and the quoted text is the dialog it was sitting on. Two seen in
+practice, both machine-level rather than anything about the model:
 
 > The License Manager is not functioning or is improperly installed. Revit will
 > shut down now.
 
-and then sits on that dialog. The dialog is raised before journal playback
-begins, so pyRevit cannot auto-dismiss it, and the run produces no output at all
-until the silence timeout fires. So the agent refuses up front whenever any Revit
-is running, and reports *needs attention* — a retry cannot help while Revit is
-open.
+> This action cannot be completed because the other program is busy.
 
-`taskkill /F` does **not** clear a Revit stuck like that; it returns "the
-operation returned because the timeout period expired" and the process stays.
-The agent presses the dialog's buttons first — the dialog means it, and Revit
-shuts down once acknowledged — and only then terminates the process.
+Both trace to Autodesk licensing rather than Syncguard. The licensing service log
+at `C:\ProgramData\Autodesk\AdskLicensingService\Log\AdskLicensingService.log`
+shows the real cause:
 
-The agent also reports which cloud models the live session has opened, so the
-message can name one. That list over-reports slightly: a model loaded only as a
-*link*, or opened and then closed during the session, still counts.
+```
+timed-out after 30.0 sec(s) waiting for Agent to connect
+```
+
+`AdskLicensingAgent.exe` did not answer inside Revit's 30-second checkout window.
+It gets worse with repetition, because each timeout makes the service launch
+*another* agent, and several competing agents make the handshake fail more often.
+If runs keep failing this way, check for duplicates:
+
+```powershell
+Get-Process AdskLicensingAgent, AdskAccessUIHost -ErrorAction SilentlyContinue |
+    Group-Object ProcessName | Select-Object Name, Count
+```
+
+More than one of each means the pile-up has happened. Killing the extras (they
+respawn on demand) or rebooting clears it. Note this is *not* caused by having
+another Revit open — it reproduced with no other Revit running.
+
+Note also that `taskkill /F` does **not** clear a Revit stuck on such a dialog:
+it returns "the operation returned because the timeout period expired" and the
+process stays. The agent presses the dialog's buttons first — Revit shuts down
+once acknowledged — and only then terminates the process.
 
 **Amber icon, "Autodesk sign-in needed".** Open Revit on that machine, sign in to
 Autodesk, then click the icon → **Recheck Autodesk sign-in**. It also clears

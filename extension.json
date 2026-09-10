@@ -1,7 +1,7 @@
 {
     "name": "EasyBIM",
     "description": "EasyBIM team PyRevit extension for Revit 2023+",
-    "url": "https://github.com/maximn-png/EasyBIM.Revit-Plugin",
+    "url": "https://github.com/easybim-il/EasyBIM.Revit-Plugin",
     "type": "extension",
     "author": "EasyBIM Team",
     "min_revit_ver": 2023

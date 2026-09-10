@@ -168,14 +168,16 @@ def revit_running():
 # `taskkill /F` IS NOT ENOUGH, measured. A Revit blocked on a pre-journal modal
 # dialog survives it: taskkill returns "This operation returned because the
 # timeout period expired" and the process stays. The case that produced this was
-# a second Revit dying on
+# a Revit dying on
 #
 #     "The License Manager is not functioning or is improperly installed.
 #      Revit will shut down now."
 #
-# because another Revit already held the single-user licence. The dialog says
-# Revit will shut down, and it does — as soon as somebody presses OK. So the
-# working sequence is: press the buttons, then terminate if it is still there.
+# after losing the licence-checkout race (see recent_licence_failure — the cause
+# is AdskLicensingAgent.exe missing Revit's 30-second window, NOT a second Revit
+# holding the licence, which was an early wrong guess). The dialog says Revit
+# will shut down, and it does — as soon as somebody presses OK. So the working
+# sequence is: press the buttons, then terminate if it is still there.
 
 _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
                                       wintypes.LPARAM)
@@ -387,6 +389,83 @@ def autodesk_user():
         if found:
             return found.group(1).strip()
     return ""
+
+
+LICENSING_LOG = (
+    r"C:\ProgramData\Autodesk\AdskLicensingService\Log\AdskLicensingService.log")
+
+# Only the tail is read; these logs run to megabytes.
+LICENSING_TAIL_BYTES = 512 * 1024
+
+_LICENCE_LINE_RE = re.compile(
+    r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})[.\d]*\s*\[[A-Z]\]\s*(.*)$")
+
+_LICENCE_FAILURE_MARKERS = (
+    "timed-out after",
+    "CheckoutFlow error",
+    "Unable to find or launch Agent",
+)
+
+
+def recent_licence_failure(since_epoch):
+    """Autodesk licensing errors logged since `since_epoch`, newest last.
+
+    Why this exists: Revit's licence checkout gives AdskLicensingAgent.exe 30
+    seconds to answer, and on a machine where the agent takes longer to start,
+    Revit dies before it ever reaches the script. Measured repeatedly here:
+
+        timed-out after 30.0 sec(s) waiting for Agent to connect
+
+    with the agent then registering 9-16 seconds too late. From the agent's own
+    vantage point that failure is invisible — no progress file, no result, and
+    an exit code of 0 once Revit auto-dismisses its own "will shut down" dialog.
+    Reading it out of the licensing log is the difference between telling
+    somebody "Revit produced no output, check your install" and telling them
+    what actually happened.
+    """
+    try:
+        size = os.path.getsize(LICENSING_LOG)
+        with open(LICENSING_LOG, "rb") as handle:
+            if size > LICENSING_TAIL_BYTES:
+                handle.seek(size - LICENSING_TAIL_BYTES)
+            blob = handle.read()
+    except OSError:
+        return []
+
+    found = []
+    for raw in blob.decode("utf-8", "replace").splitlines():
+        if not any(marker in raw for marker in _LICENCE_FAILURE_MARKERS):
+            continue
+        match = _LICENCE_LINE_RE.match(raw)
+        if not match:
+            continue
+        try:
+            when = time.mktime(
+                time.strptime(match.group(1), "%Y/%m/%d %H:%M:%S"))
+        except ValueError:
+            continue
+        if when + 1 < since_epoch:
+            continue
+        text = match.group(2).strip()
+        if text and text not in found:
+            found.append(text)
+    return found
+
+
+def licence_headline(errors):
+    """The most human-readable line out of `errors`.
+
+    The log repeats the same fault several ways, most of them carrying internal
+    agent GUIDs. The bare timeout line is the one worth putting in front of a
+    person.
+    """
+    for text in errors:
+        if "timed-out after" in text and "waiting for Agent" in text:
+            return text
+    for text in errors:
+        if "CheckoutFlow error" in text:
+            return text
+    return errors[-1] if errors else ""
 
 
 class SignInState(object):

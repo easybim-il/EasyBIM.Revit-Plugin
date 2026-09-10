@@ -315,34 +315,31 @@ class AgentCore(object):
             forwarder.step("open-revit", "running", "Starting Revit %s"
                            % job.revit_version)
 
-            # ANY running Revit blocks the run, not just one holding the target
-            # model. Measured: `pyrevit run` starts a second Revit, which dies
-            # on "The License Manager is not functioning or is improperly
-            # installed. Revit will shut down now." because the first instance
-            # already holds the single-user licence. It then sits on a modal
-            # dialog that is raised before journal playback, so pyRevit cannot
-            # suppress it, and the run produces no output whatsoever until the
-            # silence timeout fires ten minutes later.
+            # Defensive re-check of the platform's enqueue refusal: a human can
+            # open the target model in the seconds between enqueue and claim,
+            # and colliding costs a workset-ownership tangle.
             #
-            # So this check is not the belt-and-braces re-check it started as —
-            # it is the difference between an instant, accurate refusal and ten
-            # wasted minutes ending in a misleading "stopped responding".
-            if machine.revit_running():
-                collision = machine.model_is_open(job.model_name)
-                if collision:
-                    detail = "Revit is open with %s" % collision
-                else:
-                    detail = "Revit is open"
-                forwarder.line("error", "%s on %s — a second Revit cannot get "
-                                        "a licence while one is already open"
-                               % (detail, self.machine_name))
+            # Scoped to the TARGET MODEL, not to any running Revit. An earlier
+            # version of this widened to "any Revit is open" after a run died
+            # on "The License Manager is not functioning or is improperly
+            # installed", which looked like two Revits fighting over a
+            # single-user licence. That inference was wrong: the same failure
+            # then reproduced with no other Revit running at all, and the
+            # licensing service log showed the real cause both times —
+            # "timed-out after 30.0 sec(s) waiting for Agent to connect",
+            # i.e. AdskLicensingAgent.exe failing to answer inside Revit's
+            # checkout window. Concurrency was incidental. Do not re-widen this
+            # without evidence that concurrent Revits are themselves the fault.
+            collision = machine.model_is_open(job.model_name)
+            if collision:
+                forwarder.line("error", "Revit is already open with %s on %s"
+                               % (collision, self.machine_name))
                 forwarder.step("open-revit", "failed", "Revit already open")
                 forwarder.flush_now()
                 self._complete(
                     job, "needs_attention",
-                    "%s on %s. Close Revit there, then run again — Syncguard "
-                    "starts its own Revit and cannot while another is open."
-                    % (detail, self.machine_name),
+                    "Revit is open with %s on %s — close it there, then run "
+                    "again." % (job.model_name, self.machine_name),
                     forwarder)
                 return
 

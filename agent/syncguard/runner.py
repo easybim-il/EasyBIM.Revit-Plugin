@@ -191,6 +191,7 @@ class SyncRunner(object):
         self._log = logger or (lambda *_a, **_k: None)
         self.phase = "startup"
         self._phase_started = time.time()
+        self._started_at = time.time()
         self.blocking_dialogs = []
 
     def _set_phase(self, phase):
@@ -204,6 +205,9 @@ class SyncRunner(object):
 
     def execute(self):
         job = self.job
+        # Bounds the licensing-log search, so a failure from an earlier run is
+        # never blamed on this one.
+        self._started_at = time.time()
         cli = find_pyrevit_cli()
         script = find_sync_script()
         if not cli:
@@ -424,18 +428,37 @@ class SyncRunner(object):
                                   "text": "Revit was showing: %s" % text})
 
             # Silence during startup with nothing written at all means Revit
-            # never reached the script. That is a machine-state problem, not a
-            # transient one — most often another Revit already holding the
-            # single-user licence — so a retry fails identically.
+            # never reached the script. When Revit left a dialog behind, that
+            # dialog IS the diagnosis and a human should see it verbatim —
+            # these have been licence-checkout and COM-busy faults, which need
+            # the machine seen to rather than a blind retry.
             if self.phase == "startup" and progress_bytes == 0:
-                detail = (" Revit said: %s" % self.blocking_dialogs[0]) \
-                    if self.blocking_dialogs else ""
+                licence_errors = machine.recent_licence_failure(self._started_at)
+                if licence_errors:
+                    diagnostics["licensingErrors"] = licence_errors[-6:]
+                    for text in licence_errors[-4:]:
+                        lines.append({"level": "error",
+                                      "text": "Autodesk licensing: %s" % text})
+                    return Outcome(
+                        "needs_attention",
+                        "Autodesk licensing on this computer did not respond "
+                        "in time, so Revit never ran the sync. This is a "
+                        "machine problem rather than anything about the model "
+                        "— the licensing log reports “%s”."
+                        % machine.licence_headline(licence_errors),
+                        lines, diagnostics)
+                if self.blocking_dialogs:
+                    return Outcome(
+                        "needs_attention",
+                        "Revit could not start properly on this computer and "
+                        "never ran the sync. It reported: “%s”"
+                        % self.blocking_dialogs[0],
+                        lines, diagnostics)
                 return Outcome(
                     "needs_attention",
                     "Revit started but never ran the Syncguard script on this "
-                    "computer. Close any other Revit window there and try "
-                    "again — a second Revit cannot get a licence while one is "
-                    "already open.%s" % detail,
+                    "computer, and left no explanation. Check pyRevit and the "
+                    "EasyBIM extension on that machine.",
                     lines, diagnostics)
             return Outcome("failed", None, lines, diagnostics)
 
@@ -448,18 +471,57 @@ class SyncRunner(object):
                           "%s). The run crashed part-way." % exit_code}],
                 diagnostics)
 
-        # Nothing at all: no result, no progress. Exit code disambiguates.
-        # `pyrevit run` exits 0 having done nothing when it cannot find the
-        # script — the absolute-path trap — which is a configuration fault that
-        # will fail identically forever, so it must not be reported as a
-        # retryable failure.
+        # Nothing at all: no result, no progress. Two very different causes
+        # share this shape, and blaming the wrong one sends people hunting in
+        # the wrong place:
+        #
+        #   * pyrevit never found the script (the absolute-path trap). Its
+        #     console is empty, because it printed nothing before giving up.
+        #   * pyrevit set up fine and REVIT died before reaching the script,
+        #     most often losing the licence-checkout race. Its console still
+        #     carries the execution banner naming the script it was going to
+        #     run, so the banner is what tells the two apart.
         console = self._console_tail(console_path)
         if exit_code == 0:
-            lines = [{"level": "error",
-                      "text": "Revit produced no output at all. The Syncguard "
-                              "script was not run."}]
+            pyrevit_ran = "Execution Environment" in console or "Script:" in console
+            licence_errors = machine.recent_licence_failure(self._started_at)
+            if licence_errors:
+                diagnostics["licensingErrors"] = licence_errors[-6:]
+
+            lines = []
+            if pyrevit_ran:
+                lines.append({
+                    "level": "error",
+                    "text": "Revit started but closed before running the sync.",
+                })
+            else:
+                lines.append({
+                    "level": "error",
+                    "text": "Revit produced no output at all. The Syncguard "
+                            "script was not run.",
+                })
+            for text in licence_errors[-4:]:
+                lines.append({"level": "error",
+                              "text": "Autodesk licensing: %s" % text})
             if console:
                 lines.append({"level": "info", "text": console})
+
+            if licence_errors:
+                return Outcome(
+                    "needs_attention",
+                    "Autodesk licensing on this computer did not respond in "
+                    "time, so Revit shut down before syncing. This is a "
+                    "machine problem rather than anything about the model — "
+                    "the licensing log reports “%s”."
+                    % machine.licence_headline(licence_errors),
+                    lines, diagnostics)
+            if pyrevit_ran:
+                return Outcome(
+                    "needs_attention",
+                    "Revit started but closed before running the sync, without "
+                    "saying why. Check Revit and Autodesk licensing on that "
+                    "computer.",
+                    lines, diagnostics)
             return Outcome(
                 "needs_attention",
                 "Syncguard could not run the Revit script on this computer. "

@@ -12,7 +12,7 @@ A shared PyRevit extension for the EasyBIM team. Supports Revit 2023 and above.
 2. Open Revit → **pyRevit tab → pyRevit Settings → Extensions**.
 3. Click **Add Extension from Repository** and paste:
    ```
-   https://github.com/maximn-png/EasyBIM.Revit-Plugin
+   https://github.com/easybim-il/EasyBIM.Revit-Plugin
    ```
 4. Click **Install** → restart Revit.
 
@@ -62,7 +62,7 @@ Install these four tools:
 Once everything is installed, open PowerShell and run this one command — it downloads the plugin code to the exact folder where Revit will find it:
 
 ```powershell
-git clone https://github.com/maximn-png/EasyBIM.Revit-Plugin "$env:APPDATA\pyRevit\Extensions\EasyBIM.extension"
+git clone https://github.com/easybim-il/EasyBIM.Revit-Plugin "$env:APPDATA\pyRevit\Extensions\EasyBIM.extension"
 ```
 
 > **Note:** the GitHub repository is named `EasyBIM.Revit-Plugin`, but the local folder must be named `EasyBIM.extension` — pyRevit only loads extension folders whose name ends with `.extension`. The clone command above handles this for you.
@@ -175,7 +175,7 @@ fix/short-description
 
 **Step 2 — Open a Pull Request**
 
-Go to `https://github.com/maximn-png/EasyBIM.Revit-Plugin` — you will see a yellow banner with a **"Compare & pull request"** button. Click it, describe what your button does, and click **Create pull request**.
+Go to `https://github.com/easybim-il/EasyBIM.Revit-Plugin` — you will see a yellow banner with a **"Compare & pull request"** button. Click it, describe what your button does, and click **Create pull request**.
 
 **Step 3 — Wait for Maxim's review**
 
