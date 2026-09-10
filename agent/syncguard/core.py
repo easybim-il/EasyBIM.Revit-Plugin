@@ -194,8 +194,19 @@ class AgentCore(object):
         interval = HEARTBEAT_MIN_SEC
         while not self._stop.is_set():
             if not self._token:
-                self._stop.wait(5)
-                continue
+                # Pick up an enrollment performed elsewhere. The documented way
+                # to enroll a headless machine is `--enroll CODE` in a second
+                # process while the agent runs as a scheduled task, so without
+                # this re-read that agent would stay dormant until it restarted.
+                found = config.load_token()
+                if found:
+                    self._log("picked up a token written by another process")
+                    self._token = found
+                    self.api.token = found
+                    self._set(status=STATUS_IDLE, last_error="")
+                else:
+                    self._stop.wait(5)
+                    continue
             snapshot = machine.take_snapshot(self.sign_in)
             result = self.api.heartbeat(snapshot, AGENT_VERSION)
 
