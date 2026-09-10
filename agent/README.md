@@ -154,6 +154,19 @@ slightly: a model loaded only as a *link*, or opened and then closed during the
 session, still counts. Refusing wrongly costs a click; colliding costs a tangled
 model.
 
+**"Autodesk licensing on this computer did not respond in time".** The most
+common real-world failure so far, and nothing to do with Syncguard or the model.
+Revit gives `AdskLicensingAgent.exe` 30 seconds to answer a licence checkout. On
+a machine where the agent takes longer to start, Revit gives up and shuts down
+before it ever runs the script — measured here at 9 to 16 seconds too late,
+repeatedly. The agent reads the reason out of the licensing log and quotes it, so
+the run says what happened instead of "no output".
+
+It is worth knowing that this failure is *invisible* from the outside: no
+progress file, no result, and an exit code of 0, because Revit auto-dismisses its
+own "will shut down" dialog through the journal. Without the licensing-log lookup
+it looks exactly like a broken install.
+
 **"Revit could not start properly … It reported: …".** Revit never reached the
 script, and the quoted text is the dialog it was sitting on. Two seen in
 practice, both machine-level rather than anything about the model:
