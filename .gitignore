@@ -6,3 +6,8 @@ Thumbs.db
 *.log
 .vscode/
 .idea/
+
+# Syncguard agent runtime state (tokens, logs, run artefacts) lives in
+# %APPDATA%\EasyBIM\Syncguard, never in the repo. This is belt and braces.
+agent/**/token.bin
+agent/**/agent.log

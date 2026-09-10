@@ -202,9 +202,22 @@ EasyBIM.extension/
 │   └── easybim/                   ← shared Python library
 │       ├── revit.py
 │       ├── ui.py
-│       └── data.py
+│       ├── data.py
+│       └── syncguard.py
+├── commands/                      ← headless scripts, no ribbon button
+│   └── syncguard_command.py           ← run by `pyrevit run`, not clicked
+├── tools/                         ← standalone utilities, run outside Revit
+│   └── acc_issues_export.py           ← plain Python 3 + openpyxl
 └── startup.py
 ```
+
+**`commands/` vs `tools/` vs a pushbutton.** A pushbutton is clicked by a person
+inside Revit. A `commands/` script runs *inside* Revit but with no UI, launched
+from the command line as
+`pyrevit run <absolute path to the script> --revit=2025 --purge` — that is how
+automation drives Revit on a workstation. A `tools/` script never touches Revit
+at all and runs under a normal Python 3 install. Shared logic still belongs in
+`lib/easybim/` so a button and a headless command can use the same code.
 
 ---
 
